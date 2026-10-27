@@ -12,7 +12,11 @@
   "browser": { "binding": "BROWSER" },
 
   "triggers": { "crons": ["* * * * *"] },
-  "vars": { "WORKER_NAME": "qflarebot" },
+  "vars": {
+    "WORKER_NAME": "qflarebot",
+    "CF_ACCOUNT_ID": "d4270bb54cbaf351695a8c9b421caf47",
+    "CF_DEFAULT_DOMAIN": "qflarebot.nmbfc.site"
+  },
   "observability": { "enabled": true },
   "workers_dev": true,
   "preview_urls": true
