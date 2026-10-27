@@ -1,0 +1,275 @@
+import {
+  extractRefIndex,
+  type RawGroupEvent,
+  type RawInteractionEvent,
+  type RawMessageEvent,
+  type WebhookPayload,
+} from '@qqbot/api'
+import {
+  EVENT_ID_REPLYABLE,
+  isMessageEvent,
+  qqAvatar,
+  toEventName,
+  type Interaction,
+  type InteractionCode,
+  type InteractionType,
+  type Mention,
+  type OutgoingMessage,
+  type Scene,
+  type SendOptions,
+  type SendResult,
+  type SendTarget,
+  type Session,
+  type StreamChunkOptions,
+  type StreamWriter,
+} from '@qqbot/sdk'
+import { toAttachments } from './attachments.js'
+import { displayContent } from './content.js'
+import { buildQuote } from './quote.js'
+import type { RefIndexTable } from './refIndex.js'
+import { createStreamWriter } from './stream.js'
+
+/** 出站抽象：真实环境是 QQBotClient，测试与 dry-run 用记录器 */
+export interface Sender {
+  sendMessage(target: SendTarget, message: OutgoingMessage, options?: SendOptions): Promise<SendResult>
+  typing?(userOpenid: string, seconds?: number, options?: SendOptions): Promise<SendResult>
+  streamChunk?(userOpenid: string, content: string, options: StreamChunkOptions): Promise<SendResult>
+  recallMessage?(target: SendTarget, messageId: string): Promise<boolean>
+  ackInteraction?(interactionId: string, code?: InteractionCode): Promise<boolean>
+}
+
+export interface SessionOptions {
+  botId: string
+  /** 机器人资料，来自快照（面板保存凭证时从 /users/@me 拉取）；未配置为空串 */
+  botName?: string
+  botAvatar?: string
+  /** Bot 管理员名单（见 botAdmins.ts），决定 session.isBotAdmin；不传当没有 */
+  botAdmins?: readonly string[]
+  /** ref index → 消息 id 对照表：收到的消息记进去，引用消息从这里补 quote.messageId；不传就不记也不查 */
+  refIndexes?: RefIndexTable
+  sender: Sender
+  maxPassiveReplies: number
+}
+
+const INTERACTION_TYPES: Record<number, InteractionType> = {
+  11: 'button',
+  12: 'menu',
+  13: 'feedback',
+  14: 'clear_session',
+  15: 'story',
+  16: 'switch_model',
+  18: 'user_authorize',
+  19: 'group_authorize',
+  20: 'group_authorize_status',
+}
+
+interface Identity {
+  scene: Scene
+  targetId: string
+  userId: string
+  userName: string
+}
+
+/** 从各类事件的 `d` 推断场景、目标与用户；不同事件的 openid 位置不同 */
+function identify(rawType: string, d: RawMessageEvent & RawInteractionEvent & RawGroupEvent): Identity {
+  const author = d.author ?? {}
+  const userName = author.username ?? d.username ?? ''
+  const memberId = author.member_openid ?? d.group_member_openid ?? d.member_openid ?? ''
+  const userOpenid = author.user_openid ?? d.user_openid ?? ''
+
+  if (rawType === 'INTERACTION_CREATE') {
+    if (d.scene === 'group' || d.group_openid) {
+      return { scene: 'group', targetId: d.group_openid ?? '', userId: d.group_member_openid ?? '', userName }
+    }
+    if (d.scene === 'guild' || d.channel_id) {
+      return { scene: 'guild', targetId: d.channel_id ?? '', userId: d.data?.resolved?.user_id ?? '', userName }
+    }
+    return { scene: 'c2c', targetId: d.user_openid ?? '', userId: d.user_openid ?? '', userName }
+  }
+
+  if (rawType.startsWith('GROUP_') || d.group_openid) {
+    return { scene: 'group', targetId: d.group_openid ?? '', userId: memberId || userOpenid || author.id || '', userName }
+  }
+  if (rawType.startsWith('C2C_') || rawType.startsWith('FRIEND_') || rawType === 'SUBSCRIBE_MESSAGE_STATUS') {
+    const id = userOpenid || (d.openid as string | undefined) || author.id || ''
+    return { scene: 'c2c', targetId: id, userId: id, userName }
+  }
+  if (rawType === 'DIRECT_MESSAGE_CREATE' && d.guild_id) {
+    return { scene: 'guild_dm', targetId: d.guild_id, userId: author.id ?? '', userName }
+  }
+  if (d.channel_id) {
+    return { scene: 'guild', targetId: d.channel_id, userId: author.id ?? '', userName }
+  }
+  return { scene: 'unknown', targetId: '', userId: userOpenid || author.id || '', userName }
+}
+
+/**
+ * 去掉消息里的 <@id> 提及与首尾空白。ID 有两种形状：频道是纯数字（<@!123456>），
+ * 群是 32 位十六进制 openid（<@1A2B…>），都按十六进制字符集匹配。
+ */
+function cleanContent(content: string | undefined): string {
+  return (content ?? '').replace(/<@!?[0-9A-Fa-f]+>/g, '').trim()
+}
+
+function buildInteraction(d: RawInteractionEvent, sender: Sender): Interaction {
+  const resolved = d.data?.resolved ?? {}
+  const rawType = d.type ?? d.data?.type ?? 0
+  let acked = false
+  return {
+    id: d.id,
+    type: INTERACTION_TYPES[rawType] ?? 'unknown',
+    rawType,
+    buttonId: resolved.button_id ?? '',
+    buttonData: resolved.button_data ?? '',
+    featureId: resolved.feature_id ?? '',
+    messageId: resolved.message_id ?? '',
+    feedback: resolved.feedback_opt === 'LIKE' || resolved.feedback_opt === 'UNLIKE' ? resolved.feedback_opt : undefined,
+    get acked() {
+      return acked
+    },
+    async ack(code = 0) {
+      if (acked || !sender.ackInteraction) return false
+      acked = true
+      return sender.ackInteraction(d.id, code)
+    },
+  }
+}
+
+export function buildSession(payload: WebhookPayload, options: SessionOptions): Session {
+  const rawType = payload.t ?? 'UNKNOWN'
+  const d = (payload.d ?? {}) as RawMessageEvent & RawInteractionEvent & RawGroupEvent
+  const { scene, targetId, userId, userName } = identify(rawType, d)
+  // 群消息的 author 自带成员角色；单聊/频道没有，未知值归一化为 undefined。
+  // 部分群事件（成员变动等）把角色放顶层，作回退读取。
+  const rawRole = typeof d.author?.member_role === 'string' ? d.author.member_role : (d as { member_role?: unknown }).member_role
+  const role = typeof rawRole === 'string' ? rawRole.toLowerCase() : ''
+  const memberRole =
+    scene === 'group' && (role === 'owner' || role === 'admin' || role === 'member')
+      ? (role as 'owner' | 'admin' | 'member')
+      : undefined
+  // 被 @ 者的 id / 名字：线上群全量消息带 id / username，腾讯官方适配器的类型里还有 member_openid / nickname，都读。
+  // is_you（@ 的就是本机器人）也算 bot，插件过滤机器人时不会把自己当成被 @ 的群友
+  const str = (v: unknown) => (typeof v === 'string' ? v : '')
+  const mentions: Mention[] = (d.mentions ?? []).map((m) => ({
+    id: str(m.member_openid) || str(m.id) || str(m.user_openid),
+    username: str(m.nickname) || str(m.username),
+    bot: m.bot === true || m.is_you === true,
+  }))
+  const event = toEventName(rawType)
+  // 是否在呼叫本机器人，规则照 AstrBot 的 QQ 官方适配器：单聊/频道私信天然是；at_message 事件平台只在被 @ 时推送；
+  // 群全量消息看 mentions 里平台标的 is_you——bot 标记只说明被 @ 的是机器人，群里有别的机器人时会误判。
+  // 频道全量消息（MESSAGE_CREATE）AstrBot 没接，仍按 bot 标记尽力推断
+  const mentionsMe =
+    rawType === 'GROUP_MESSAGE_CREATE' ? (d.mentions ?? []).some((m) => m.is_you === true) : mentions.some((m) => m.bot)
+  const atMe = isMessageEvent(event) && (scene === 'c2c' || scene === 'guild_dm' || rawType.includes('AT_MESSAGE') || mentionsMe)
+  const eventId = payload.id ?? `${rawType}:${d.id ?? Date.now()}`
+  const messageId = typeof d.id === 'string' && rawType.includes('MESSAGE') ? d.id : undefined
+  const eventReplyId = !messageId && EVENT_ID_REPLYABLE.has(rawType) ? eventId : undefined
+  const timestamp =
+    typeof d.timestamp === 'number' ? d.timestamp * 1000 : d.timestamp ? Date.parse(d.timestamp) || Date.now() : Date.now()
+  const here: SendTarget = { scene, id: targetId }
+  const { sender, refIndexes } = options
+  const refIndex = extractRefIndex(d)
+  // 记下这条消息，之后有人引用它时才查得到消息 id
+  refIndexes?.remember(here, refIndex, messageId)
+
+  // 同一条消息/事件的被动回复由这里统一编号
+  let seq = 0
+  // 回复条数与序号分开：typing 不计条数，一个流不论多少分片只占一条。
+  let replies = 0
+  let lastSent: string | undefined
+
+  const passive = (): SendOptions | null => {
+    if (scene === 'unknown' || !targetId) return null
+    if (messageId) return { messageId }
+    if (eventReplyId) return { eventId: eventReplyId }
+    return null
+  }
+
+  const track = (result: SendResult): SendResult => {
+    if (result.ok && result.messageId) lastSent = result.messageId
+    return result
+  }
+
+  const fail = (error: string): SendResult => ({ ok: false, status: 0, error, raw: null })
+
+  const resolveQuote = (message: OutgoingMessage): OutgoingMessage => {
+    if (typeof message === 'string' || message.quote !== true) return message
+    const { quote: _q, ...rest } = message
+    return refIndex ? { ...rest, quote: refIndex } : rest
+  }
+
+  const session: Session = {
+    botId: options.botId,
+    botName: options.botName ?? '',
+    botAvatar: options.botAvatar ?? '',
+    platform: 'qq',
+    event,
+    rawType,
+    id: eventId,
+    timestamp,
+    raw: payload.d,
+    scene,
+    targetId,
+    userId,
+    userName,
+    avatarUrl: qqAvatar(options.botId, userId),
+    memberRole,
+    isBotAdmin: userId !== '' && (options.botAdmins?.includes(userId) ?? false),
+    messageId,
+    refIndex,
+    quote: buildQuote(d, refIndexes && ((ref) => refIndexes.lookup(here, ref))),
+    canReply: passive() !== null,
+    content: cleanContent(d.content),
+    displayContent: displayContent(d, options.botId),
+    mentions,
+    atMe,
+    attachments: toAttachments(d.attachments),
+    interaction: rawType === 'INTERACTION_CREATE' ? buildInteraction(d, sender) : undefined,
+
+    async reply(message) {
+      const base = passive()
+      if (!base) return fail('当前事件不支持被动回复')
+      if (replies >= options.maxPassiveReplies) return fail(`被动回复已达上限 ${options.maxPassiveReplies} 条`)
+      replies += 1
+      seq += 1
+      return track(await sender.sendMessage(here, resolveQuote(message), { ...base, msgSeq: seq }))
+    },
+
+    async send(message, target) {
+      const to = target ?? here
+      if (to.scene === 'unknown' || !to.id) return fail('缺少发送目标')
+      return track(await sender.sendMessage(to, resolveQuote(message)))
+    },
+
+    async typing(seconds = 10) {
+      if (scene !== 'c2c' || !sender.typing) return fail('输入中状态仅支持单聊')
+      const base = passive()
+      if (!base) return sender.typing(targetId, seconds, {})
+      // 不带 msgSeq 时客户端默认填 1，正好和第一条回复撞号
+      seq += 1
+      return sender.typing(targetId, seconds, { ...base, msgSeq: seq })
+    },
+
+    stream(): StreamWriter {
+      const base = passive()
+      const canStream = scene === 'c2c' && !!sender.streamChunk && !!base
+      let streamSeq: number | undefined
+      return createStreamWriter(canStream ? async (chunk, opts) => {
+        if (streamSeq === undefined) {
+          if (replies >= options.maxPassiveReplies) return fail(`被动回复已达上限 ${options.maxPassiveReplies} 条`)
+          replies += 1
+          streamSeq = ++seq
+        }
+        return track(await sender.streamChunk!(targetId, chunk, { ...base!, msgSeq: streamSeq, ...opts }))
+      } : undefined, (content) => session.reply(content))
+    },
+
+    async recall(id) {
+      const target = id ?? lastSent
+      if (!target || !sender.recallMessage || scene === 'unknown') return false
+      return sender.recallMessage(here, target)
+    },
+  }
+  return session
+}

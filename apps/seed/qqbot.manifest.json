@@ -1,0 +1,26 @@
+{
+  "core": {
+    "version": "0.6.0",
+    "source": "file:../../packages/runtime/dist/runtime.js"
+  },
+  "ui": {
+    "version": "0.6.0",
+    "source": "file:../../packages/ui/dist/ui.js"
+  },
+  "plugins": [
+    {
+      "name": "sid",
+      "version": "0.1.0",
+      "source": "file:../../plugins/sid/dist/plugin.js",
+      "enabled": true,
+      "manifest": "file:../../plugins/sid/dist/manifest.json"
+    },
+    {
+      "name": "t2i",
+      "version": "0.1.0",
+      "source": "file:../../plugins/t2i/dist/plugin.js",
+      "enabled": true,
+      "manifest": "file:../../plugins/t2i/dist/manifest.json"
+    }
+  ]
+}

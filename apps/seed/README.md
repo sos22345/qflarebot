@@ -1,0 +1,195 @@
+# 种子应用
+
+这是最终部署到 Cloudflare 的 Worker。它不包含框架代码，只声明"用哪个运行时、装哪些插件"。
+
+## 两种入口
+
+- `src/index.ts`：静态入口，直接 import 工作区插件，供 `wrangler dev` 与快速部署。
+- `dist/index.js`：由清单投影生成（本地 `pnpm project`，或构建机上的 `manifest:prepare`），用 `wrangler.generated.jsonc` 或自部署脚本部署。
+
+## 首次部署：引导工作流（推荐）
+
+仓库根目录的 [`.github/workflows/bootstrap.yml`](../../.github/workflows/bootstrap.yml) 会把资源创建、
+部署、密钥写入一次做完。**幂等可重跑、零 Git 污染**：资源按名字复用，全程不向你的 fork 产生任何提交。
+
+1. Fork 本仓库。
+2. 运行 **Bootstrap** 工作流（Actions → Bootstrap → Run workflow），两种模式自动选择：
+   - **网页引导**（什么都没配时）：工作流起一个临时网页（Quick Tunnel），网址打在「网页引导」这一步的
+     实时日志里（Summary 要等这一步结束才显示，步骤见[快速部署](https://qflarebot.github.io/deploy)），
+     跟着网页走——网页会给出**权限预填的** token 创建链接，粘贴 token 即时校验
+     （缺哪个权限当场点名），然后建资源、看进度、连接仓库、创建构建 token。
+   - **无 UI 引导**（配了 secret `CLOUDFLARE_API_TOKEN` 时）：直接跑完，后续步骤写进
+     run 页 Summary。首次部署还要配 secret `ADMIN_TOKEN`，必须自己定（它就是面板登录密钥，只有你知道明文），
+     缺了会在建资源之前失败；重跑时不配就沿用 Worker 上已有的。
+3. 工作流结束后照 Summary 里的清单收尾：绑定自定义域名、在面板「设置」里创建或绑定 QQ 机器人、QQ 开放平台填回调地址、连接仓库（网页向导里已做完）。
+
+**日志与 Summary 不带隐私信息。** 公开仓库的 Actions 日志和 Summary 谁都能看：账户 ID、workers.dev 子域、
+KV / D1 的 id 一拿到就经 `::add-mask::` 打码（wrangler 部署时打印的地址也被遮住），Summary 里只写后续步骤，
+不写面板地址、`MANIFEST_URL`、账户与资源标识，后台链接用 `dash.cloudflare.com/?to=/:account/...` 占位。
+面板地址只在网页向导的完成页显示；无 UI 模式到 Cloudflare 后台 Worker → Settings → Domains & Routes 里看。
+多账户时账户 ID 建议配成 secret `CLOUDFLARE_ACCOUNT_ID`：workflow 的 `account_id` 输入会公开显示在运行页。
+
+**自定义域名必须绑，由你自己选、自己绑。** QQ 开放平台访问不到 `*.workers.dev`（已实测，回调验证不通过），
+所以回调必须走你自己的域名。引导只部署到默认的 `<Worker名>.<子域>.workers.dev`（面板与构建机拉清单用它），
+不接收也不绑定自定义域名，也不给出 workers.dev 的回调地址。部署完到 Cloudflare 后台 Worker → Settings →
+Domains & Routes 的 Custom Domains 添加一个（域名要托管在同一个 Cloudflare 账户下），回调地址填
+`https://你的域名/webhook`——用新域名打开面板，概览页可以一键复制。之后的部署（重跑引导、自部署构建）都不会改动你绑的域名。
+
+Token 权限清单（预填链接已带；手动创建照此勾选）：
+
+| 权限组 | 级别 |
+| --- | --- |
+| Workers Scripts | Edit |
+| Workers KV Storage | Edit |
+| D1 | Edit |
+| Workers R2 Storage | Edit |
+| Account Settings | Read |
+| Workers 构建配置（Workers Builds Configuration，也可能显示为 Workers CI） | Edit（网页向导用：自动检测仓库连接、写构建配置、补跑首次构建；无 UI 模式用不到） |
+| 账户范围 | 所有账户（或包含目标账户） |
+
+> 引导只做**只读探测**（GET 一个列表端点）：通过只说明读权限够用，Edit 缺失要到真正部署时才报 403。
+> 用上面的预填链接创建 token 可以避开这个盲区；手动创建时请照表逐项勾选。
+
+引导做了什么（无 UI 模式的完整清单）：
+
+- 验证 token 与权限；单账户自动推导账户 ID（多账户要求配 secret `CLOUDFLARE_ACCOUNT_ID`，或填 `account_id` 输入）
+- **幂等创建/复用**同名 KV / D1 / R2（名字可在 workflow 输入里改；R2 未激活时自动降级为
+  不绑定，只在后台激活 R2 后重跑即可）
+- 读取 D1 里已安装的插件，与内置清单一起构建——重跑引导不会把面板里装的插件从线上抹掉。
+  Worker 还不存在时用 `wrangler deploy` 建脚本；已经存在（重跑）时走和自部署构建同一条 Versions API 路径：
+  预览地址健康检查、secret 保全校验都过了才切流量，再用 `wrangler triggers deploy` 同步 Cron 与 workers.dev
+  （Versions API 不碰脚本级设置）。没有 D1 / R2 的部署传 `CF_D1_ID=none` / `CF_R2_NAME=none`，过得了绑定护栏
+- 资源 id、Worker 名**不进 Git**：经 `wrangler secret bulk` 写入 Worker Secrets，
+  并通过 `GET /admin/build-config` 构建端点动态下发给构建机（K/V、D1 必须有 id：自部署走的
+  Versions API 不认名字，缺 id 报 10021）
+- 写入 Worker 密钥：`ADMIN_TOKEN`（**必须自己设置**，至少 12 个字符：无 UI 模式取自你的 GitHub
+  secret，网页向导模式在表单里填；重跑时可以沿用 Worker 上已有的、不改密码。引导不代为生成，也不在任何地方回显——
+  公开仓库的日志与 Summary 谁都能看，生成出来的密码没有安全的途径交到你手上）、`CF_ACCOUNT_ID`、`CF_WORKER_NAME`、`CF_KV_ID`、`CF_D1_ID`、
+  `CF_R2_NAME`、`CF_DEFAULT_DOMAIN`，配了 `CLOUDFLARE_BUILDS_TOKEN`
+  secret 时再写 `CF_BUILDS_TOKEN`
+- **不碰 QQ 凭证**：机器人在部署之后到面板「设置」里建——手机 QQ 扫码确认即新建一个，AppID/AppSecret
+  自动存进 KV（协议同 AstrBot）；已有机器人就填入它的凭证，保存前先向 QQ 验证。回调地址扫码给不了，
+  仍要到 QQ 开放平台手填一次。以前的 secrets `QQ_APPID` / `QQ_APP_SECRET` 不再读取
+
+> R2 在新账户上需要先到后台激活一次（免费额度内不扣费），API 替代不了；向导会在前置检查里提醒。
+
+### 手动首次部署（不用工作流）
+
+```bash
+pnpm install && pnpm build
+wrangler login                                  # OAuth，免建 API token
+# 手工把 KV / D1 创建出来并把 id 填进 wrangler.jsonc（或依赖 wrangler deploy 的自动预配）
+wrangler secret put ADMIN_TOKEN                 # 随机长字符串
+pnpm --filter @qqbot/seed run deploy
+```
+
+不接触线上环境就想确认部署配置没问题时，先投影再 dry-run（免凭证）：
+
+```bash
+pnpm --filter @qqbot/seed run project
+pnpm --filter @qqbot/seed run deploy:check      # = wrangler deploy --dry-run，CI 也跑这一步
+```
+
+## 插件以源码分发
+
+- 框架版本（core/ui）与**内置插件**在仓库的 `qqbot.manifest.json`，git 管理：diff、回滚、审查都免费。
+- **已安装插件集存在 D1**（`rt_manifest_plugins`），由面板/管理 API 增删；每次安装/卸载/构建都记录在 `rt_installs` 账本（清单哈希、build_uuid、commit、状态）。
+- 两份清单在构建时合并，D1 同名覆盖内置插件。
+
+## 自部署：Worker 触发 Workers Builds
+
+装/卸插件需要重新编译，而 Worker 里没有编译器。所以流程是：**Worker 改 D1 清单 → 调 Builds REST API
+触发一次构建 → 构建机拉源码编译并部署**。设置步骤：
+
+1. 仓库推到 GitHub，在 Cloudflare Dashboard 的 Worker → Settings → Builds 里连接仓库（引导工作流会给出直达链接）。
+2. **构建命令、环境变量、排除路径与构建缓存不用手填。** 仓库一连上，这几项就会经 Builds API 自动写进 trigger：
+
+   | 项 | 值 |
+   | --- | --- |
+   | Build command | `pnpm build && pnpm --filter @qqbot/seed run manifest:prepare` |
+   | Deploy command | `pnpm --filter @qqbot/seed run manifest:deploy` |
+   | Build watch paths → Exclude | `docs/*` `templates/*` `.github/*` `scripts/*` `design-system/*` `*.md` `LICENSE`：只改这些时不重建机器人。在 trigger 已有的排除路径上合并，你自己加的不会丢 |
+   | Build cache | 打开：缓存下载过的 npm / pnpm 包，装依赖快一些（Cloudflare 默认是关的） |
+   | 环境变量 `MANIFEST_URL` | `https://<默认域名>/admin/build-manifest` |
+   | 环境变量 `MANIFEST_TOKEN` | Worker 侧 `BUILD_TOKEN` 的同值（引导自动生成） |
+
+   写入时机有两处：**网页向导**在你连完仓库、点「完成引导」时写；**无 UI 引导**跑的时候 trigger
+   还不存在（仓库尚未连接），改由 Worker 在第一次触发构建、自发现到 trigger 时补写。
+   每项只写一次（KV 里记着写到了哪一版），之后你在后台的手动调整不会被覆盖回去。排除路径和构建缓存是后加的：
+   早先部署、已经写过前几项的 Worker，会在下一次从面板触发构建时只补还没写过的那几项，别的不动。
+
+3. 可选的构建环境变量：
+
+   | 变量 | 说明 |
+   | --- | --- |
+   | `MANIFEST_FALLBACK` | 默认不设。**只在应急时**设成 `1`：允许清单拉取失败后回退到仓库内置清单 |
+   | `CF_WORKERS_DEV` | **一般别设。** 设 `0` 会在生成配置里写 `workers_dev: false`，只在降级为 `wrangler deploy` 时生效（Versions API 不碰这项）。而构建机拉清单用的 `MANIFEST_URL` 指向 workers.dev，关掉它之后装插件、更新插件的构建都会失败——真要关，先把构建环境变量 `MANIFEST_URL` 改成自定义域名。版本预览地址由 `preview_urls` 单独控制，与它无关 |
+
+   > **清单拉不到 = 构建失败**（除非上面那个 `MANIFEST_FALLBACK=1`）。这是故意的：继续构建只会打包
+   > 仓库内置清单，D1 里装的插件会从 Worker 上消失（数据还在 D1，插件不跑了），而构建却报成功——
+   > 这是最难查的一类故障。
+   >
+   > 唯一的例外是**本次部署本来就没有绑 D1**：那时清单端点返回 503 是预期的，构建机读
+   > `/admin/build-config` 的 `hasD1`（由 Worker 侧的 `!!env.DB` 如实回答）自行判断并继续。
+   > 注意判据是 `hasD1` 而不是 `d1Id`——后者来自 `CF_D1_ID` secret，「secret 没写但 D1 确实绑着」
+   > 会被误判成「没有 D1」，于是面板一抖动就静默把 D1 里装的插件从 Worker 上抹掉。
+   > 所以别为了绕过报错去设 `MANIFEST_FALLBACK`——先看清楚是「面板连不上」还是「真的没有 D1」。
+
+4. 给 Worker 配置触发构建用的凭证（`wrangler secret put`，引导工作流会自动写入）：
+
+   | 变量 | 说明 |
+   | --- | --- |
+   | `CF_ACCOUNT_ID` | Cloudflare 账号 ID |
+   | `CF_BUILDS_TOKEN` | **user-scoped** API token（Builds API 不接受 account-scoped），权限：Workers Builds Configuration (Edit) + Workers Scripts (Read) + Workers Observability (Edit)。最后一项给面板从 Workers Logs 读最近事件与 24 小时统计，缺了只是看不到，不影响构建 |
+   | `CF_WORKER_TAG` / `CF_TRIGGER_UUID` | **可选**。省略时运行时按 `vars.WORKER_NAME` 自发现并缓存进 KV（要求仓库已连接 Workers Builds；重连仓库导致缓存失效会自动重发现）。想写死也可以：tag 是 `GET /accounts/{account_id}/workers/scripts` 返回的 `tag` 字段（`id` 是名字，别拿错），trigger UUID 来自 `GET /accounts/{account_id}/builds/workers/{tag}/triggers` |
+   | `CF_BUILD_BRANCH` | 可选。省略时用连接仓库时在 Workers Builds 里选的生产分支（每次触发构建现查，fork 后改了分支名、或在后台改了生产分支都会跟着走），查不到才用 `main`。配了就以它为准 |
+   | `BUILD_TOKEN` | 构建机拉清单的专用令牌，引导首次自动生成并写入，**重跑沿用 Worker 上已有的值、不轮换**（trigger 里那份不会跟着变，换了构建就 401）——**Worker 侧叫 `BUILD_TOKEN`，构建机侧叫 `MANIFEST_TOKEN`，是同一个值**。两边的对齐由引导代劳（自动写 trigger 环境变量），不用自己搬。想换值：`wrangler secret put BUILD_TOKEN` 后同步改构建环境变量，或重跑无 UI 引导时配 `BUILD_TOKEN` secret |
+
+   `vars.WORKER_NAME` 在 `wrangler.jsonc` 里（引导工作流按 Worker 名同步维护），自发现靠它定位自己。
+
+流程与安全阀：
+
+- `POST /admin/builds` 用 `{"branch":"main"}` 触发构建（构建分支当前状态，无需自己解析最新 commit），返回 `buildUuid` 记入账本；`GET /admin/builds` 轮询状态并回填 commit，Cron 每分钟也会检查一次（账本里没有进行中的记录时不产生任何请求）。
+- **声明了 Durable Object 的插件在安装这一步就被拦下。** DO 的 `migrations` 是只追加的历史，平台靠「上次应用过的 tag」算增量，构建机没有这个持久状态、造不出来，所以投影只校验不合成。校验发生在构建阶段——不拦的话插件已经写进 D1 才炸，而且是**每一次**构建都炸（包括之后装别的插件），直到有人想到卸载它。运行时读不到仓库里的 `wrangler.jsonc`，判断不了那条 migrations 加没加，所以把要加的内容原样给出，由用户确认后重装。
+- `deploy` 阶段直接用构建产物走 Versions API：上传版本 → 预览地址 `/healthz?plugins=1` 健康检查 → 切 100% 流量，健康检查失败不切（含 Durable Object 的 Worker 无预览 URL，平台限制下跳过）。带 `plugins=1` 时运行时会把每个插件都求值一遍，有插件一 import 就抛错时回 503 并列出是哪些——构建机像插件构建失败一样把它们经 `/admin/build-report` 报回面板（`phase: "health"`），线上保持上一次成功的版本。不认识这个参数的旧运行时照常回 200，行为同以前。
+- 部署目标取 `wrangler.generated.jsonc` 的 `name`，不是模板的——`CF_WORKER_NAME` 只在 `prepare` 进程里被 `/admin/build-config` 注入，而构建机的 build 与 deploy 是两条独立命令、两个进程。Workers Builds 会注入 `WRANGLER_CI_OVERRIDE_NAME`（这次构建连着的 Worker），降级到 `wrangler deploy` 时 wrangler 用的是它而不是配置里的 name；两者不一致时构建日志里会有醒目告警，并且 Versions API 报「脚本不存在」（10007）时**不降级**、直接失败——那是名字对不上，不是首次创建（降级的话以后每次都会静默跳过健康检查，名字碰巧是同账号另一个机器人时还会部署到它身上）。
+- 绑定没解析出来（`dist/projection.json` 的 `bindings` 里有 `unresolved`）一律拒绝部署。判据是投影记下的解析状态而不是元数据里的占位符：D1/R2 没解析出来时是**整个绑定不出现**，扫占位符只拦得住 KV。Worker 如实回答没绑的资源（`/admin/build-config` 的 `hasD1` / `hasR2` 为假，比如 R2 未激活被降级）按显式跳过（`CF_D1_ID=none` / `CF_R2_NAME=none`）处理，不算没解析出来。**KV 不能跳过**：运行时无条件用它（快照、插件配置都在里面），`CF_KV_ID=none` 不受支持、按没解析出来处理——以前它被当成跳过，降级到 wrangler 时会自动预配一个全新的 KV，快照当场失联。
+- 降级到 `wrangler deploy` 时会打一段醒目警告并列出本次会同步的脚本级设置（routes / workers_dev / crons）——Versions API 不碰这些，wrangler 会按配置改。自定义域名例外：模板与生成配置都不声明 routes，wrangler 在这种情况下完全不碰域名（一旦声明，它会按配置**整体替换**，后台另绑的会被摘掉）。只有**上传版本这一步**报 10007 或 401/403 才降级；版本已经传上去之后（取子域、健康检查、切流量）哪一步报错都不降级，否则 wrangler 会绕过健康检查直接上线。
+- 构建机拉不到构建清单时**硬失败**（见上文），只有「这次部署确实没有 D1」（`/admin/build-config` 的 `hasD1` 为假）或显式 `MANIFEST_FALLBACK=1` 才会回退到仓库内置清单。
+- **git 插件在机器人仓库外面构建，依赖按插件自己的 lockfile 装**：源码解包到系统临时目录，有第三方依赖的执行 `npm ci --omit=dev --ignore-scripts`（有 `pnpm-lock.yaml` 时用 pnpm），再在子进程里打包、抽清单。装依赖与打包的子进程只拿到**白名单**里的环境变量（`PATH`、`HOME`、临时目录、区域设置、代理、证书、npm 源地址、corepack / Node 版本管理器、`XDG_*` 等），构建环境里别的变量——部署凭证、拉清单的令牌、你自己放的 `OPENAI_API_KEY` / `DATABASE_URL`——插件代码一概读不到；npm 源的认证配置（`_authToken` 之类）也不传。没有第三方依赖的插件不走安装；有依赖却没提交 lockfile 的直接失败。插件解析不到机器人仓库里装着的包——要用什么，写进插件自己的 `dependencies`。
+- **有插件构建失败就不部署**，线上保持上一次成功的版本。构建机不在第一个失败处停下，而是把每个 git 插件都试一遍，把「哪个插件、为什么」经 `POST /admin/build-report` 报回面板（线上 Worker 是不认识这个端点的旧版本时只告警），再让构建失败。失败的条目留在 D1 里，之后每次构建都会带上它，所以要在面板插件页「未上线的改动」里卸载或撤销它。
+- **网络问题不记到插件头上**。下载源码 tarball 每次限时 60 秒、网络错误与 5xx 重试 3 次，装依赖遇到网络类失败（连不上源、源站 5xx、超时）也重试；重试完仍不行的，报成这次构建的整体错误（`build-report` 的顶层 `error`），不写进插件的 `failures`——否则 codeload 抽风一次，面板就会建议你卸载一个没问题的插件。稍后重新触发构建即可。
+- 构建机给每个插件记下出处（D1 装的还是仓库内置的、原始 git 来源）写进入口模块，面板据此分清已上线与未上线；出处不参与投影哈希，本地 `pnpm project` 与构建机的哈希照样一致。
+- 回滚三选一：Cloudflare 后台版本回滚；D1 恢复清单快照 + 重新触发构建；git revert 内置清单 + 重建。
+
+## 路由
+
+| 路径 | 说明 |
+| --- | --- |
+| `POST /webhook` | QQ 回调地址（在开放平台填 `https://<你的域名>/webhook`） |
+| `GET /healthz` | 健康检查，含投影哈希 |
+| `/` | 管理面板 |
+| `/admin/*` | 管理 API，需 `Authorization: Bearer <管理密钥或会话令牌>`；建议再挂 Cloudflare Access |
+| `/p/<插件>/*` | 插件自己的 HTTP 路由；`auth: 'admin'` 的接受面板会话或该插件的桥接令牌 |
+
+## 管理端点（自部署相关）
+
+| 端点 | 说明 |
+| --- | --- |
+| `GET /admin/build-manifest` | 构建机拉取插件清单 `{ hash, plugins, pendingBuild }`；`BUILD_TOKEN` 优先，未配置走管理鉴权。`pendingBuild` 是触发这次构建的账本记录（构建机带 `x-build-uuid` 头时精确对上，不带时取最近一条进行中的），构建机据此对照「触发时」与「实际构建」的清单哈希，不一致只告警 |
+| `POST /admin/build-report` | 构建机回报失败原因 `{ buildUuid, phase, failures: [{ name, source, error }], error? }`；鉴权同上。`phase` 是 `prepare`（构建）、`deploy`（部署）或 `health`（预览健康检查里插件加载失败）；`failures` 是具体插件的错误，`error` 是与插件无关的整体错误（网络问题、投影失败……）。错误记到 D1 条目（只记 source 没变的那条）与这次构建的账本上，**不改清单** |
+| `GET /admin/manifest/plugins` | D1 清单里每个插件与线上部署的对照：`deployed` 已上线、`differs` 线上是另一份、`not_deployed` 线上根本没有（等构建或构建失败——这类插件不在 `/admin/status` 里，靠这里才看得到、卸载得了）；`removing` 列出线上还在跑、D1 里已删的（卸载还没生效）；`inSync` 表示 D1 是否已全部上线 |
+| `POST /admin/manifest/plugins` | 安装/升级 `{ source: "git:owner/repo@sha[#子目录]" }`**并就地触发一次重建**；校验声明清单、撞名、conflicts、depends。可选 `dryRun: true` 只预检不写（返回清单摘要、`warnings` 与 DO 提示），`build: false` 只写清单不构建（批量更新：逐个写，最后 `POST /admin/builds` 一次）。同名换仓库、命令重名、覆盖内置插件等只放进 `warnings`，不拦。插件**新增**了 Durable Object 类时返回 409 `durable_objects_migration_required` 并给出要往 `wrangler.jsonc` 补的 migrations（见下），补完后带 `acknowledgeDurableObjects: true` 重新安装；DO 类没变的升级不再拦 |
+| `DELETE /admin/manifest/plugins/:name[?purge=true][&build=false]` | 卸载（移出 D1 清单）**并就地触发一次重建**；响应里的 `build` 是 `{ buildUuid }`、`{ error }` 或 `{ skipped, reason }`——触发失败不回滚卸载，需要手动重试构建；卸载的是从没上线的插件时清单已与线上一致，不触发构建。`purge=true` 连插件数据一起清，默认保留；新版本上线后 Cron 会再收一次尾（删 onInstall 标记、按需再清数据）。清数据一次只删一批（约 500 个 KV 键），`data` 里的 `kvRemaining` / `r2Remaining` / `tablesRemaining` 是还剩多少、`purgeError` 是中途出的错，没清完的由那次收尾接着删。线上跑的是同名的仓库内置插件（覆盖还没上线就撤掉）时 `data.liveIsBuiltin` 为真：不跑钩子、不清数据 |
+| `POST /admin/builds` | 触发构建，返回 `buildUuid` |
+| `GET /admin/builds` | 安装/构建账本，顺带同步进行中构建的状态与 commit。Cron 也会自动同步（有进行中记录时最快 3 分钟一次），所以装完插件关掉页面账本照样会收敛 |
+| `GET /admin/storage` | 各插件占用的 KV 键数 / D1 表与行数 / R2 对象数与字节数，以及不属于任何已装插件的孤儿数据 |
+| `DELETE /admin/storage/orphans/:name` | 清掉某个已卸载插件的残留数据（对还装着的插件返回 409）。一次只删一批：`done` 为假时 `kvRemaining` 等字段是还剩多少，再调一次接着删 |
+
+面板 → 插件页可以直接粘贴仓库链接安装（自动解析最新 commit，先预检再确认）、「检查全部更新」后勾选批量更新（只构建一次）、在「未上线的改动」里卸载或撤销构建失败的条目，并查看构建记录；以上端点也可用 curl / 任意客户端调用。
+
+## 本地清单格式
+
+`qqbot.manifest.json` 是 `DeployManifest`：`core.version` 指运行时版本；每个插件的 `source` 支持 `file:`（相对本文件）、`git:<owner>/<repo>@<commit>[#子目录]`（源码构建，推荐）；旧模型兼容 `npm:<pkg>`、`github:<owner>/<repo>`（Release 制品）、`url:<https://…>`。`manifest` 可以是内联对象，也可以是 `file:` 指向构建产物的 `manifest.json`。
+
+`git:` 来源要求插件仓库提交声明清单（根目录 `manifest.json`，`qqbot-plugin build` 生成）：安装前安装器读它做校验与展示，构建时重新抽取并与它比对，不一致即构建失败。比对只在一处放宽：声明清单是作者当时的 SDK 生成的，框架后来新加的、带默认值的字段（比如 `durableObjects: []`）声明清单里没有，抽出来是空默认值（`[]`、`{}`、`false`）就算一致；`apiVersion` 不一致只告警（安装时已按声明清单检查过）。两边都有的字段仍须一致——框架升级不要求插件重新打包，真改了代码没重新生成清单照样拦得住。

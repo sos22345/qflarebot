@@ -1,0 +1,269 @@
+@import '@qqbot/ui-bridge/tokens.css';
+@import 'tailwindcss';
+@import './styles/motion.css';
+
+/* 把语义 token 映射成 Tailwind 工具类：bg-surface、text-fg-muted、border-border … */
+@theme inline {
+  --color-*: initial;
+  --color-bg: var(--qb-bg);
+  --color-surface: var(--qb-surface);
+  --color-surface-muted: var(--qb-surface-muted);
+  --color-input: var(--qb-input);
+  --color-fg: var(--qb-fg);
+  --color-fg-muted: var(--qb-fg-muted);
+  --color-fg-subtle: var(--qb-fg-subtle);
+  --color-border: var(--qb-border);
+  --color-border-strong: var(--qb-border-strong);
+  --color-card-border: var(--qb-card-border);
+  --color-glass: var(--qb-glass);
+  --color-glass-border: var(--qb-glass-border);
+  --color-overlay: var(--qb-overlay);
+  --color-accent: var(--qb-accent);
+  --color-on-accent: var(--qb-on-accent);
+  --color-primary: var(--qb-primary);
+  --color-primary-hover: var(--qb-primary-hover);
+  --color-on-primary: var(--qb-on-primary);
+  --color-brand: var(--qb-brand);
+  --color-ring: var(--qb-ring);
+  --color-success: var(--qb-success);
+  --color-warning: var(--qb-warning);
+  --color-danger: var(--qb-danger);
+  --color-success-bg: var(--qb-success-bg);
+  --color-warning-bg: var(--qb-warning-bg);
+  --color-danger-bg: var(--qb-danger-bg);
+  --color-white: #fff;
+  --color-black: #000;
+  --color-transparent: transparent;
+
+  --font-sans: var(--qb-font-sans);
+  --font-mono: var(--qb-font-mono);
+
+  --radius-sm: var(--qb-radius-sm);
+  --radius-md: var(--qb-radius);
+  --radius-lg: var(--qb-radius-lg);
+  --radius-xl: var(--qb-radius-xl);
+
+  --shadow-card: var(--qb-shadow);
+  --shadow-card-hover: var(--qb-shadow-hover);
+  --shadow-overlay: var(--qb-shadow-overlay);
+
+  --ease-out: var(--qb-ease-out);
+  --ease-spring: var(--qb-ease-spring);
+
+  --text-xs: var(--qb-text-xs);
+  --text-sm: var(--qb-text-sm);
+  --text-base: var(--qb-text-base);
+  --text-lg: var(--qb-text-lg);
+  --text-xl: var(--qb-text-xl);
+  --text-2xl: var(--qb-text-2xl);
+}
+
+/* 放进 base 层：工具类（focus:outline-none、accent-*）才压得住它们 */
+@layer base {
+  html {
+    min-height: 100%;
+  }
+  body {
+    min-height: 100dvh;
+    margin: 0;
+    background-color: var(--qb-bg);
+    color: var(--qb-fg);
+    font: var(--qb-text-base) / var(--qb-leading) var(--qb-font-sans);
+    -webkit-font-smoothing: antialiased;
+    -webkit-tap-highlight-color: transparent;
+    text-rendering: optimizeLegibility;
+  }
+  /* 底色上的两团光晕固定在视口里，滚动时不跟着走（iOS 不支持 background-attachment: fixed，用伪元素） */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    background: var(--qb-bg-glow);
+    pointer-events: none;
+  }
+  #app {
+    min-height: 100dvh;
+  }
+  :focus-visible {
+    outline: 2px solid var(--qb-ring);
+    outline-offset: 2px;
+  }
+  input[type='radio'] {
+    accent-color: var(--qb-accent);
+  }
+  /* 勾选框统一画：浏览器自带的那个在柔光风格里太突兀；勾号用遮罩画，颜色跟着主题走 */
+  input[type='checkbox'] {
+    appearance: none;
+    -webkit-appearance: none;
+    display: inline-grid;
+    place-content: center;
+    flex-shrink: 0;
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    border: 1.5px solid var(--qb-border-strong);
+    border-radius: 5px;
+    background: var(--qb-input);
+    cursor: pointer;
+    transition:
+      background-color var(--qb-duration) var(--qb-ease),
+      border-color var(--qb-duration) var(--qb-ease);
+  }
+  input[type='checkbox']::before {
+    content: '';
+    width: 10px;
+    height: 10px;
+    background: var(--qb-on-accent);
+    -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.5 6.3 5 8.8l4.5-5.6'/%3E%3C/svg%3E") center / contain no-repeat;
+    mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.5 6.3 5 8.8l4.5-5.6'/%3E%3C/svg%3E") center / contain no-repeat;
+    transform: scale(0);
+    transition: transform var(--qb-duration-slow) var(--qb-ease-spring);
+  }
+  input[type='checkbox']:checked {
+    border-color: var(--qb-accent);
+    background: var(--qb-accent);
+  }
+  input[type='checkbox']:checked::before {
+    transform: scale(1);
+  }
+  input[type='checkbox']:indeterminate {
+    border-color: var(--qb-accent);
+    background: var(--qb-accent);
+  }
+  input[type='checkbox']:indeterminate::before {
+    height: 2px;
+    border-radius: 1px;
+    -webkit-mask: none;
+    mask: none;
+    transform: scale(1);
+  }
+  input[type='checkbox']:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  /*
+   * 浏览器往输入框里塞的小部件一律藏掉，需要的都自己画了：Edge 密码框的小眼睛（密钥字段有自己的显示按钮）、
+   * Safari 的钥匙 / 联系人填充图标、搜索框的叉号、数字框的上下箭头
+   */
+  input::-ms-reveal,
+  input::-ms-clear {
+    display: none;
+  }
+  input::-webkit-credentials-auto-fill-button,
+  input::-webkit-contacts-auto-fill-button,
+  input::-webkit-strong-password-auto-fill-button {
+    visibility: hidden;
+    position: absolute;
+    right: 0;
+    width: 0;
+    pointer-events: none;
+  }
+  input[type='search']::-webkit-search-cancel-button,
+  input[type='search']::-webkit-search-decoration,
+  input::-webkit-inner-spin-button,
+  input::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    appearance: none;
+    margin: 0;
+  }
+  input[type='number'] {
+    -moz-appearance: textfield;
+    appearance: textfield;
+  }
+}
+
+@layer components {
+  /* 半透明面板：侧栏、手机顶栏、抽屉 */
+  .qb-glass {
+    background: var(--qb-glass);
+    border: 1px solid var(--qb-glass-border);
+    -webkit-backdrop-filter: blur(var(--qb-glass-blur)) saturate(1.4);
+    backdrop-filter: blur(var(--qb-glass-blur)) saturate(1.4);
+  }
+
+  /* 输入框、下拉、多行文本共用的外观 */
+  .qb-control {
+    border: 1px solid var(--qb-border-strong);
+    border-radius: var(--qb-radius);
+    background: var(--qb-input);
+    color: var(--qb-fg);
+    transition:
+      border-color var(--qb-duration) var(--qb-ease),
+      box-shadow var(--qb-duration-slow) var(--qb-ease-out);
+  }
+  .qb-control::placeholder {
+    color: var(--qb-fg-subtle);
+  }
+  /* focus-within：数字框这种外框里套着输入框和按钮的，里面任何一个拿到焦点都亮起外框 */
+  .qb-control:focus,
+  .qb-control:focus-within {
+    outline: none;
+    border-color: var(--qb-accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--qb-accent) 22%, transparent);
+  }
+  .qb-control--invalid,
+  .qb-control--invalid:focus,
+  .qb-control--invalid:focus-within {
+    border-color: var(--qb-danger);
+  }
+  .qb-control--invalid:focus,
+  .qb-control--invalid:focus-within {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--qb-danger) 20%, transparent);
+  }
+  .qb-control:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  /* 输入框、下拉浮层里的滚动条：细一点、颜色跟主题走 */
+  .qb-control,
+  .qb-menu {
+    scrollbar-width: thin;
+    scrollbar-color: var(--qb-border-strong) transparent;
+  }
+  .qb-menu {
+    transform-origin: top;
+  }
+  .qb-menu[data-placement='top'] {
+    transform-origin: bottom;
+  }
+
+  /* 表格：紧凑、可扫读 */
+  .qb-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--qb-text-sm);
+  }
+  .qb-table th {
+    text-align: left;
+    font-weight: 500;
+    font-size: var(--qb-text-xs);
+    color: var(--qb-fg-muted);
+    padding: 0 var(--qb-space-3);
+    height: 34px;
+    border-bottom: 1px solid var(--qb-border);
+    white-space: nowrap;
+  }
+  .qb-table td {
+    padding: 0 var(--qb-space-3);
+    height: var(--qb-row-height);
+    border-bottom: 1px solid var(--qb-border);
+    vertical-align: middle;
+    transition: background-color var(--qb-duration) var(--qb-ease);
+  }
+  .qb-table th:first-child,
+  .qb-table td:first-child {
+    padding-left: var(--qb-space-4);
+  }
+  .qb-table th:last-child,
+  .qb-table td:last-child {
+    padding-right: var(--qb-space-4);
+  }
+  .qb-table tbody tr:last-child td {
+    border-bottom: 0;
+  }
+  .qb-table tbody tr:hover td {
+    background: var(--qb-surface-muted);
+  }
+}

@@ -1,0 +1,556 @@
+---
+description: 从零写一个 QFlareBot 插件：命令与事件、回复消息、配置、存储、定时任务、自带 Web 页面，以及免费版的平台限额。
+---
+
+# 插件开发指南
+
+目标：只看这一篇，就能写出一个能用的插件。API 细节以 `@qqbot/sdk` 的类型注释为准；平台能力对照见[平台能力对照](./capabilities.md)。跑在免费版部署上时，第 9 节的平台限额是硬约束，动笔前先扫一眼。
+
+## 1. 最小可用插件
+
+```ts
+// src/index.ts
+import { definePlugin } from '@qqbot/sdk'
+
+interface Config {
+  greeting: string
+}
+
+export default definePlugin<Config>({
+  // 包名 qflarebot-plugin-hello 去掉前缀的短名；构建时校验与 package.json 一致
+  name: 'hello',
+  displayName: '问好',
+  description: '最小示例：命令 + 配置 + KV',
+  permissions: ['kv'], // 仅供安装前展示，运行时不强制
+
+  // 面板据此渲染配置表单并在保存时校验
+  configSchema: {
+    type: 'object',
+    properties: { greeting: { type: 'string', title: '问候语', default: '你好' } },
+    required: ['greeting'],
+  },
+  defaultConfig: { greeting: '你好' },
+
+  commands: {
+    // 返回值就是回复；ctx.config 是面板里保存的配置
+    hello: ({ ctx, argText }) => `${ctx.config.greeting}，${argText || '朋友'}`,
+
+    // 生成器连发多条（同一条消息的被动回复默认最多 5 条）
+    async *count() {
+      for (let i = 1; i <= 3; i++) yield `${i}`
+    },
+
+    // 运行时数据用 ctx.kv（自动加插件前缀，别的插件看不到）
+    async remember({ session, ctx, argText }) {
+      await ctx.kv.put(`note:${session.userId}`, argText)
+      return '记住了'
+    },
+    async mynote({ session, ctx }) {
+      return (await ctx.kv.get(`note:${session.userId}`)) ?? '没有记录'
+    },
+  },
+
+  // 正则以模式为键，/…/i 形式带 flags
+  regex: { '/^ping$/i': () => 'pong' },
+
+  // 事件：入群欢迎（走 event_id 被动回复，不消耗主动消息额度）
+  events: { 'qq.group.robot_added': ({ ctx }) => `${ctx.config.greeting}，我是机器人，发送 /hello 试试` },
+})
+```
+
+配套文件与命令（详见模板 `templates/plugin`）。SDK 与 `qqbot-plugin` 不发 npm，从 QFlareBot 源码构建，和插件仓库并排放——模板的 `devDependencies` 指向 `file:../QFlareBot/packages/*`：
+
+```bash
+git clone https://github.com/QFlareBot/QFlareBot
+(cd QFlareBot && pnpm install --filter '@qqbot/plugin-cli...' && pnpm --filter '@qqbot/plugin-cli...' build)
+cd qflarebot-plugin-hello    # 与 QFlareBot 同级
+npm install
+
+npm run build            # 生成 dist/plugin.js + dist/manifest.json
+npm run sync             # 把 dist/manifest.json 复制到仓库根目录（声明清单，随代码提交）
+npm test                 # @qqbot/sdk/testing 提供 runCommand / createMockSession / createMockContext
+```
+
+装到机器人：面板 → 插件 → 安装插件，粘贴仓库链接，先预检（权限、命令重名、要补的 DO migrations 一次列出来），确认后安装并就地触发构建——等价于 `POST /admin/manifest/plugins` 提交 `{"source": "git:<owner>/<repo>@<完整commit>"}`（加 `"dryRun": true` 只预检不写）。构建机拉源码编译，声明清单与源码不一致会直接失败。**只支持公开的 GitHub 仓库**：安装时匿名读仓库里的 `manifest.json`，构建机也是匿名下载源码，私有仓库两步都会 404。
+
+安装记录钉在具体 commit 上——推了新代码不会自动生效。更新就是换到上游默认分支的最新提交：面板「已装插件」里点「检查全部更新」，勾选要更新的，点「更新选中」——逐个写进清单、**只触发一次构建**（API 上是每个 `POST /admin/manifest/plugins` 带 `"build": false`，最后 `POST /admin/builds`）。单个插件的 `check-update` / `update` 端点照旧可用。
+
+构建失败时线上保持上一次成功的版本，失败原因回报到面板：插件页「未上线的改动」列出所有写进了清单、却还没在线上生效的安装 / 升级 / 卸载，从没装上的可以直接卸载，升级失败的可以改回线上那一版。
+
+调试分两步：逻辑先用 `npm test` 在本地测（不需要机器人）——测试替身守线上的规矩，`ctx.db` 的 SQL 过同一套表名检查（见第 6 节），`session.reply` 超过被动回复上限同样返回失败、不记进 `replies`（默认 5 条，`createMockSession({ maxPassiveReplies })` 可调），线上会报的错本地就能看到；装上之后用面板「调试」页的事件模拟器，伪造一条消息或一次按键点击，看命中了哪个插件、回了什么。模拟器的回复只记录不发给 QQ，但插件里的存储读写和直接调 `ctx.api` 的请求是真的。
+
+面板插件页的「添加插件 → 插件市场」列出[插件目录](./market.md)里的插件，勾选几个一起装：逐个预检，按依赖顺序写进清单，最后只构建一次。写好了想让别人用：见[发布插件](./publish.md)，向插件目录提一个 PR。
+
+## 2. 规则
+
+- **零运行时 import**：插件不 import 运行时，所有能力从处理器入参的 `ctx` / `session` 上取。`cloudflare:workers` 需在处理器内部 `import()`。
+- **不发 npm 包**：插件以源码仓库分发，构建机编译部署，全程不向 npm 发布任何东西。
+- **第三方依赖可以用，但要满足三条**：
+  1. 写进插件自己 `package.json` 的 `dependencies`，并**提交 lockfile**（`package-lock.json` 或 `pnpm-lock.yaml`）。构建机按 lockfile 装（只装 `dependencies`，不跑安装脚本），有依赖没 lockfile 直接构建失败——否则同一个 commit 不同时间会装出不同的代码。
+  2. `@qqbot/sdk` 放 `devDependencies`：构建时一律用机器人仓库那一份。其他 `@qqbot/*` 不许 import，能力都从 `ctx` / `session` 上取。
+  3. 能在 Workers 里运行：不依赖 Node 内置模块（`fs`、`net`、`child_process`……，构建时就会报找不到）、不用 `eval` / `new Function`（运行到那一行才报错）。另外依赖的体积和初始化耗时算在全机器人共享的 CPU 里（见第 9 节），别拿大库做小事；只在浏览器里能加载的包（顶层就碰 `window` 之类）要在处理器里按需 `import()`，因为构建机是在 Node 里执行入口抽清单的。
+
+  构建机只装插件自己声明的依赖，而且在机器人仓库外面构建：以前「先在机器人仓库 `pnpm add` 再重建」的做法不再有效。没有第三方依赖的插件不走安装，与以前一样。
+
+  抽清单的子进程只带白名单里的环境变量（PATH、HOME、代理、npm 源这类），入口顶层读不到构建机上的任何凭证。上线前还有一道：新版本先在预览地址上把每个插件都加载一遍（`/healthz?plugins=1`），入口一加载就抛错的插件会让这次部署不切流量、线上保持旧版，面板「未上线的改动」里会写明是哪个插件加载失败。
+- **命名**：仓库名 = 包名 = `qflarebot-plugin-<name>`（或 `@scope/qflarebot-plugin-<name>`），`name` 用小写字母/数字/`-`/`_`——它同时是 KV 前缀、D1 表前缀、路由 `/p/<name>/` 前缀与撞名检测键。改名前的 `qqbot-plugin-<name>` 构建时照样认，但登记不进插件目录。
+- **版本**：取自 `package.json` 的 `version`。
+- **契约版本（`apiVersion`）**：清单里的是插件**最低**要求的版本，不写就是构建时 SDK 的版本。机器人接受不高于自己的：老插件在新机器人上照常能装；用了新能力的插件装到老机器人上，安装时就被拦下并提示升级机器人。用新版 SDK 构建、但没用到新能力，又想让老版本的机器人也能装，就在 `definePlugin` 里写上更低的 `apiVersion`。目前的版本：1 是初版契约；2 加了 `ctx.db.batch()` 和 `ctx.publicUrl`（机器人 0.4.0 起；`ctx.publicUrl` 可能没有值，读的时候有退路就不必写 2）；3 加了 `ctx.botAdmins`、`meetsPermission()`、`mentionedUsers()`、`session.isBotAdmin` 和 `session.quote`（机器人 0.5.0 起；两个 session 字段在老机器人上读到 undefined，分别等于「不是管理员」「没引用」，只读它们就不必写 3）；4 加了 `ctx.images` 和 `ctx.browser`（机器人 0.6.0 起；没绑定时是 undefined，老机器人上也是，先判断 undefined 的就不必写 4）。SDK 里的函数也算新能力：机器人构建插件时 `@qqbot/sdk` 用的是**机器人自己那一份**，不是插件装的，老机器人上没有这个函数，构建就会失败。
+- **permissions 只是告知**：插件与核心同 isolate、无沙箱，声明的权限运行时不强制。
+- **额度是全机器人共享的，省着用**：KV、D1、CPU、请求数的每日额度是框架和所有插件合用一份，一个插件用超了，整台机器人一起停摆（免费版 KV 一天只能写 1,000 次，D1 写 10 万行）。**不要每收到一条消息就写一次 KV 或 D1**，频繁变的数据别放 KV。怎么选存储见[第 6 节](#_6-存储状态)，额度与省写入的写法见[第 9 节](#_9-平台限额-免费版的硬预算)。
+
+## 3. 接收事件
+
+运行时把 QQ 推送标准化为 `Session` 后分发。所有处理器入参都是**单对象**，加字段向前兼容：
+
+| 匹配器 | 入参（除 session/ctx 外） | 默认 |
+| --- | --- | --- |
+| `commands` | `command`（命中的命令名或别名，子命令是完整的几个词）、`args: string[]`、`argText`（命令后的原文） | `block: true` |
+| `regex` | `match: RegExpMatchArray` | `block: false` |
+| `events` | — | `block: false` |
+| `buttons` | `interaction`、`buttonId`、`buttonData` | `block: true` |
+| `cron` | `job`、`scheduledAt`（**没有 session**） | — |
+| `routes` | `request`、`params`、`authenticated` | public |
+| `middleware` | `next()`，不调即拦截；调多次也只执行一次，建议 `await next()` | 按 priority 排序 |
+
+`block` / `priority`（大者先执行）/ `scenes`（限定 `group | c2c | guild | guild_dm`）写在匹配器对象形式里。命令前缀默认 `/`，面板可改；命令名大小写不敏感。
+
+**@ 机器人或单聊时命令可以不带前缀**（规则同 AstrBot）："@机器人 签到"等同于"/签到"。群里没开"接收全部消息"的机器人收到的都是 @ 消息，所以群聊和单聊基本都不用打前缀；判断依据见下文 `session.atMe`。
+
+**命令名带空格就是子命令**，每条都是普通命令，`permission`、`scenes`、`usage` 照常各写各的：
+
+```ts
+commands: {
+  pixiv: () => HELP,                              // 单独 /pixiv，或后面跟了不认识的词
+  'pixiv random': ({ args }) => …,                // args 从 random 后面开始
+  'pixiv illust': { usage: '/pixiv illust <id>', handler: ({ args }) => … },
+},
+```
+
+名字越长越优先（跨插件也一样），所以 `/pixiv random 大图` 只会进 `'pixiv random'`；对不上的落回 `pixiv`，`args` 照常给，和不写子命令时一样。子命令权限不够时不会退回父命令。别名不会自动组合：`pixiv` 有别名 `p站`，要 `/p站 random` 也能用，得在子命令的 `aliases` 里写 `'p站 random'`。
+
+**想让命令进 QQ 指令面板**（群友点机器人弹出的可点列表，面板「设置 → QQ 指令面板」一键发送），名字和 `description` 要短：QQ 按显示宽度算，汉字算 2、英文数字算 1，名称 ≤14（约 7 个汉字）、描述 ≤30（约 15 个汉字）。名称得和命令对得上、不能截断，命令名长就给一个短 `aliases`，面板会自动换用放得下的别名；描述超了会被截断。`qqbot-plugin build` / `validate` 发现放不进去或会被截断时会打警告，不拦构建。声明了 `permission`（`bot_admin` / `group_admin`）的命令在面板里自动标成「仅管理员可点击」；权限在处理器里自己判断的命令，想同样只给管理员点，就写 `panelOnlyAdmin: true`（反过来 `false` 可以让有门槛的命令人人可点）。它只影响面板，不拦任何人。
+
+正则只用来「判断命中 + 取捕获组」，所以运行时编译前会**剥掉 `g` 和 `y`**：带 `g` 时 `String.match` 只返回整段匹配、`match[1]` 会是 `undefined`；`y` 和 `g` 还会把 `lastIndex` 留在正则实例上，让重复匹配的结果漂移。写 `/^echo (.+)$/` 就够了，不用加这两个标志。
+
+命令加 `bare: true` 后，**没 @ 机器人**的消息也按**首词**匹配它（带前缀调用同样命中）。只有群开了"接收全部消息"、或频道私域收全量消息时才用得上：
+
+```ts
+commands: {
+  sign: { bare: true, handler: () => '已签到' },
+},
+```
+
+裸命令只应在确实需要时用——群聊首词极易撞上正常聊天。
+
+### 权限
+
+命令与正则可声明 `permission`（不声明即 `member`，人人可用），运行时在匹配阶段拦截，不达标连 handler 都不会执行：
+
+| 值 | 谁能通过 |
+| --- | --- |
+| `member` | 所有人（默认） |
+| `group_admin` | Bot 管理员、群主、群管理员（群角色来自入站消息） |
+| `bot_admin` | Bot 管理员（面板"设置 → 权限"里维护的 openid 名单） |
+
+**达标制**：上层自动通过下层门槛。单聊没有群角色，层级塌缩成"Bot 管理员 / 普通成员"两档——`group_admin` 命令在单聊只有 Bot 管理员能用。按钮回调不按层级拦截（回调事件不带群角色），要鉴权在处理器里自己判断，见下文。
+
+权限不足默认**静默跳过**（当作没匹配到，不遮蔽其他插件）；面板可设置统一回复文案，仅在没有任何插件命中时回复。
+
+门槛拦不住的场合——按钮回调、中间件、同一条命令给管理员多开几个选项——在处理器里自己判断：
+
+```ts
+import { meetsPermission } from '@qqbot/sdk'
+
+buttons: {
+  reset: ({ session }) => {
+    // 和命令的 permission 同一个判断：Bot 管理员过得去，按钮回调里没有群角色，群主也不行
+    if (!meetsPermission(session, 'group_admin')) return 4 // 4 = 无权限
+    // …
+  },
+},
+```
+
+- `session.isBotAdmin`：发起人是不是 Bot 管理员，所有场景都有，按钮回调也有。
+- `session.memberRole`：群角色，群聊时为 `'owner' | 'admin' | 'member'`，单聊、频道、按钮回调为 undefined。
+- `meetsPermission(session, 层级)`：把上面两个合起来，和命令门槛完全一致。
+- `ctx.botAdmins`：Bot 管理员的 openid 名单，只读。给没有会话的地方用（定时任务、`onInstall`），或者判断的不是发起人（比如被 @ 的人：`ctx.botAdmins.includes(mention.id)`）。要发只有管理员点得动的按钮，把它填进按钮的 `permission: { type: 0, specify_user_ids: [...ctx.botAdmins] }`，QQ 客户端那边就挡住了其他人。
+
+`meetsPermission` 和 `ctx.botAdmins` 要求 `apiVersion` 3；只读 `session.isBotAdmin` 不用，老机器人上读到 undefined，当不是管理员处理。`meetsPermission` 虽然在老机器人上也只是把人当成非管理员，但它是 SDK 里的函数，老机器人构建时找不到它（见第 2 节 `apiVersion`），所以照样要写 3。
+
+配置 Bot 管理员名单前，先在会话里发内置插件的 `/sid` 查询自己的 openid——openid 按机器人隔离，别处复制来的无效。
+
+常用事件名（完整映射见[平台能力对照](./capabilities.md#事件)）：
+
+| 事件名 | 含义 |
+| --- | --- |
+| `qq.group.at_message` / `qq.group.message` | 群里 @机器人 / 群消息 |
+| `qq.c2c.message` | 单聊消息 |
+| `qq.guild.at_message` / `qq.guild.message` / `qq.guild.direct_message` | 频道消息 |
+| `qq.group.robot_added` / `robot_removed` | 机器人群里被添加 / 移出（可用 event_id 被动回复） |
+| `qq.group.member_added` / `member_removed` / `join_request` | 群成员变动 / 入群申请 |
+| `qq.c2c.friend_added` / `friend_removed` | 加 / 删好友 |
+| `qq.interaction` | 按键/菜单回调（一般用 `buttons` 匹配器，不用直接监听） |
+
+平台新事件自动落到 `qq.raw.<t 小写>`（如 `qq.raw.group_msg_reject`），不必等框架发版。
+
+`session` 只读字段（完整类型见 `@qqbot/sdk`）：
+
+- **消息**：`content`（去 @ 后正文）、`mentions`（@ 的对象列表 `{ id, username, bot }`；群里 `id` 就是被 @ 者的 member_openid，@ 本机器人的那一项 `bot` 为 true，挑被 @ 的群友时把 `bot` 的滤掉）、`atMe`（是否在呼叫本机器人：单聊/频道私信恒为 true，@ 消息由事件类型判定，群全量消息看平台在 mentions 上标的 `is_you`，频道全量消息按 mentions 里的 bot 标记尽力推断）、`attachments`、`messageId`、`refIndex`、`quote`（这条消息引用的那条：`messageId` / `content` 原文 / `attachments` / `refIndex`，没引用时是 undefined；撤回被引用的消息就是 `session.recall(session.quote.messageId)`。群、单聊的推送不带被引用消息的 id，`messageId` 是运行时拿 ref index 查内存里的对照表补上的，只有 2 分钟内（和平台的撤回时限一样）、机器人收到过或发出的消息查得到，查不到是空串，要准备好这种情况）
+- **找被 @ 的人**：用 `mentionedUsers(session)`，返回 `{ id, username }[]`，已去掉机器人、按在消息里出现的先后排。它把 `mentions` 和原始正文里的 `<@openid>` 并起来——没开全量消息的群里「@机器人 摸 @群友」，被 @ 的群友可能只在正文里；正文开头那一串 @ 当作在叫机器人，不算
+- **展示或交给 AI 的正文**：用 `session.displayContent ?? session.content`，保留其他人的 @ 和位置，有名字时显示 `@名字`，未知对象保留原始标记；只移除能确认是本机器人的提及。QQ 的编码表情会转为可读描述，坏数据显示 `[表情]`。原有 `content` 和命令匹配规则不变，原始数据仍在 `raw`。
+- **身份**：`userId`、`userName`、`memberRole`（群聊时的 owner/admin/member）、`isBotAdmin`（是不是 Bot 管理员，见上文权限）、`avatarUrl`（用户头像 CDN 直链，640 规格，纯拼接不发请求；其他尺寸用 `qqAvatar(botId, openid, 140)`，@ 人用 `qqAt(openid)`）、`botName` / `botAvatar`（机器人自己的资料）
+- **事件与会话**：`event`、`scene`、`targetId`、`canReply`、`interaction`、`raw`（QQ 原始 `d`，标准化不够用时直接读它）
+
+## 4. 回复消息
+
+- 处理器**返回值就是回复**：字符串、消息对象、或（异步）可迭代对象逐条发。返回 `undefined` 表示自己处理完，不回复。
+- `session.reply(msg)`：被动回复本次事件（`msg_seq` 自动编号，默认上限 5 条）。
+- `session.send(msg, target?)`：主动发送；不传 target 发往当前会话。返回 `SendResult`（`ok` / `status` / `messageId` / `error`），**记得检查 `ok`**。
+- `session.canReply`：当前事件能否被动回复；返回值投递会自动退化成主动发送。
+
+消息对象（字符串即纯文本）：
+
+```ts
+{
+  text: '文字',
+  image: { url: 'https://…' },                  // 或 base64
+  media: { type: 'video', url: 'https://…' },   // video | voice | file；图 png/jpg、视频 mp4、语音 silk
+  markdown: { content: '# md' },
+  keyboard: keyboard([[button.callback('确认', 'data', { id: 'confirm' }), button.link('文档', 'https://…')]]),
+  quote: true,                                  // 引用当前消息；传 refIndex 字符串引用指定消息
+}
+```
+
+`keyboard` 会自动把消息升级为 markdown（平台要求）。按键的 `id` 对应 `buttons` 匹配器的键；按键处理器返回数字即回应平台（0 成功 · 4 无权限 …），返回消息则回复并自动 ack——客户端永远不会转圈。
+
+辅助：`session.typing(seconds)`（仅单聊，≤60s；占用一个 `msg_seq`，但不计入被动回复的条数上限）、`session.stream()`（仅单聊流式，群聊退化为 end 时一次性回复）、`session.recall(id?)`（不传撤回自己最后一条，平台限 2 分钟内）。
+
+流式写入首片立即发送，后续按 500ms 合并；`write()` 返回 `ok: true, status: 0` 表示已缓冲，必须 `await end()` 发完缓冲并检查最终结果。一个流共用一个消息序号，只占一条被动回复额度；发送失败后停止续片，重复 `end()` 不重复发送，结束后 `write()` 返回失败。
+
+原生 Markdown 被明确拒绝时，普通 Markdown 消息会降级为纯文本，优先使用消息对象的 `text`，否则使用 `markdown.content`；保留原来的回复凭据和序号。带键盘或模板的消息直接返回失败，避免静默丢掉交互或模板内容。发送结果可通过 `code`、`traceId`、`raw` 查看平台错误，包括上传阶段的错误。请求的超时与重试规则见[错误语义](./capabilities.md#错误语义)。
+
+处理器有时限：一次事件的全部处理（所有插件加起来）在给 QQ 回 ACK 之后只有 30 秒，慢活要自己拆，见[第 9 节](#_9-平台限额-免费版的硬预算)。
+
+## 5. 配置
+
+- **声明**：`defaultConfig` 出厂默认 + `configSchema`（JSON Schema）。面板按 schema 渲染表单，保存时按同一套规则校验，错误标在对应的输入框下。认得的写法都是 JSON Schema 的标准关键字：
+
+  | 写法 | 面板上 |
+  | --- | --- |
+  | `type: 'string'` / `'number'` / `'integer'` / `'boolean'`，`minLength` / `maxLength` / `minimum` / `maximum` | 输入框、开关 |
+  | `enum: [...]` | 下拉，选项就是值本身 |
+  | `oneOf: [{ const: 'fast', title: '快' }, …]` | 带标签的下拉，存的是 `const` |
+  | `format: 'textarea'`（字符串） | 多行文本框 |
+  | `writeOnly: true`（字符串） | 密钥：面板不回显，只显示「已设置」，可以更换或清除；`/admin/status` 与快照接口里也只给占位符 |
+  | `type: 'array', items: { type: 'string' }` | 逐条输入的列表 |
+  | `type: 'array', items: { enum: [...] }`（或 items 写带 `const` 的 `oneOf`） | 多选：一排可按下的标签，保存时每一项都得在选项里 |
+  | `type: 'object', properties: {…}`（可带 `required`） | 一组字段，可以嵌套 |
+  | `type: 'array', items: { type: 'object', properties: {…} }` | 卡片列表，可增删、调整顺序 |
+  | `type: 'object', additionalProperties: {…}` | 键名不固定的键值对 |
+
+  认不出的类型退回 JSON 文本框。API 密钥这类值一定标 `writeOnly: true`：不标的话任何人打开面板都能看到明文。
+
+  另有两处面板用得上的写法：
+
+  - **说明里可以放链接**：`description` 支持行内 Markdown——`[链接](https://…)`（只认 http/https，新窗口打开）、`` `代码` ``、`**粗体**`。适合写「去哪申请 API Key」。
+  - **按条件显示**：`'x-showIf': { 同级字段: 期望值 }`，每一条都满足才显示这个字段；期望值写成数组表示「等于其中任意一个」。藏起来的字段值照样保留，但保存时不校验（`required` 也跳过），免得拦着用户改一个看不见的字段。只能引用同一层的字段。
+
+    ```ts
+    properties: {
+      mode: { oneOf: [{ const: 'builtin', title: '内置' }, { const: 'custom', title: '自定义接口' }], default: 'builtin' },
+      endpoint: { type: 'string', title: '接口地址', 'x-showIf': { mode: 'custom' } },
+    }
+    ```
+
+  面板会把改过还没保存的字段标出来，和出厂默认不一样的字段给「恢复默认」：默认值取 `defaultConfig` 里对应的值，没有就取字段 schema 的 `default`。
+- **存放**：面板保存写 KV 快照，与部署解耦——改配置不触发构建，即时生效（其他节点最长约 1 分钟）。
+- **读取**：处理器里 `ctx.config`，类型由 `definePlugin<Config>` 串联。保存过的配置盖在 `defaultConfig` 上，快照里没有的字段回落默认值——所以升级后新增的配置项，保存过配置的用户也拿得到默认值。声明了 `properties` 的嵌套对象同样逐项回落；键名不固定的对象（`additionalProperties`）和数组整个替换，用户删掉的项不会被默认值加回来。
+
+配置放"人工可改的设置"；插件的运行数据用下面的存储。
+
+**不用自己做群白名单/黑名单**：面板的插件详情页有「生效的群」（所有群 / 只在这些群 / 除了这些群），框架在分发时就把不生效的群挡掉，插件在那个群里连中间件都不会跑。它只管群，单聊、频道、定时任务与 HTTP 路由不受影响。
+
+## 6. 存储状态
+
+**先选对存储**。额度全机器人共享（第 9 节），选错了最先打满的往往就是 KV：
+
+| 存什么 | 用 | 为什么 |
+| --- | --- | --- |
+| 很少改、读得多：配置、缓存、外部接口结果 | `ctx.kv` | 读 10 万次/天；**写、删、列加起来各只有 1,000 次/天**，同一个键每秒只能写 1 次。绝不要放在每条消息都会走到的路径上 |
+| 一般的状态：记录、冷却、排行、待定的交互 | `ctx.db`（D1） | 写 10 万行/天。按**改动的行数**算：删除也算写入，每个索引再多算一行，见[D1 写入怎么算](#d1-写入怎么算) |
+| 图片、音频等大文件 | `ctx.r2` | 按次数与容量按月计，单值放不下 KV / D1 的都放这里 |
+| 需要强一致的单点（同一时刻只能有一个人改）、定时唤醒 | `ctx.durable` | 要先改机器人仓库，见下 |
+
+三个按插件名自动隔离的存储，互相不可见：
+
+| 存储 | 隔离方式 | 要点 |
+| --- | --- | --- |
+| `ctx.kv` | 键前缀 `p:<名>:` | `get / getJSON<T> / put(key, value, { ttl? }) / delete / list(prefix?)`；ttl 最小 60 秒 |
+| `ctx.db` | 表名前缀 `p_<名>_` | SQL 里写 `{表名}` 占位，运行时展开；`run(sql, ...params)` / `all<T>` / `first<T>` 支持参数绑定；`batch([{ sql, params }])` 一次往返跑一批、整批是事务；`exec` 跑建表语句 |
+| `ctx.r2` | 键前缀 `p/<名>/` | 大文件：`put(key, value, { contentType? }) / get / getText / getJSON / getStream / delete / head / list` |
+| `ctx.durable` | 命名空间 `P_<名>_<类名>` | 强一致单点，见下；`get(类名, 实例名)` / `namespace(类名)` |
+
+未绑定 D1 / R2 时调用会抛可读错误（绑定见 seed 的 `wrangler.jsonc`）。建表放 `hooks.onInstall`：
+
+```ts
+hooks: {
+  // 钩子的参数就是 ctx 本身，不是 { ctx }
+  async onInstall(ctx) {
+    await ctx.db.exec(`
+      CREATE TABLE IF NOT EXISTS {notes} (user_id TEXT PRIMARY KEY, note TEXT, ts INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS {notes_ts} ON {notes}(ts);
+    `)
+  },
+  async onBoot(ctx) { /* 每个 isolate 一次的轻量初始化 */ },
+},
+```
+
+索引只给真正拿来查的列建：每个索引会让涉及它的每次写入多算一行。上面这张表每插入一行算 3 行——表本身、`{notes_ts}`，还有 `TEXT PRIMARY KEY` 背后 SQLite 自动建的那个隐藏索引。主键不是整数的表加上 `WITHOUT ROWID`（`CREATE TABLE … (…) WITHOUT ROWID`），主键就是表本身，能省掉这一行。
+
+`exec` 可以一次写多条语句、随意换行和写 `--` 注释：D1 的 `exec` 本身按行拆语句，跨行的 `CREATE TABLE` 会从第一行断掉，框架交给 D1 之前会先压成一行。唯一的限制是**引号里不能换行**（压行会改掉值，框架会直接报错），带换行的数据用 `run()` 绑定参数写入。
+
+D1 的 `{表名}` 不是语法糖，是硬规则：SQL 里出现不带本插件前缀的表名会**直接抛错**，`sqlite_master`、加引号、加库名限定都拦，`ATTACH` / `PRAGMA` 整条拒绝；索引、视图、触发器名同样要写占位（`CREATE INDEX {notes_ts} ON {notes}(ts)`）。检查只看表名所在的位置：字符串字面量和注释里的内容不受影响，往库里塞 JSON 不会被误伤；CTE 名（包括 `WITH RECURSIVE cnt(x) AS (…)` 这种带列清单的）、叫 `view` / `trigger` 的列、`a IS [NOT] DISTINCT FROM b` 也都照常能写。`npm test` 里的 mock `ctx.db` 走同一套检查（`exec` 还会查引号里的换行），写错了本地就抛同样的错。
+
+这么做有两个原因，第二个才是重点：一是插件之间不会撞表或误删；二是**框架凭前缀才知道你建过哪些表，卸载时才清得掉你的数据**。表名一旦逃出命名空间，那部分数据就永远变成没人管的孤儿。
+
+```ts
+await ctx.db.run('INSERT INTO {notes} (user_id, note, ts) VALUES (?, ?, ?)', id, note, Date.now())
+const rows = await ctx.db.all<Note>('SELECT * FROM {notes} WHERE user_id = ? ORDER BY ts DESC', id)
+```
+
+一条命令要读写好几次时用 `batch`：每次 `await ctx.db.run(...)` 都要等一次到 D1 的往返，几条下来就是用户看得见的延迟；`batch` 把整批一次发过去，而且整批是一个事务，任何一条失败整批回滚，不会只扣了钱没加上货：
+
+```ts
+const [, , balance] = await ctx.db.batch<{ coins: number }>([
+  { sql: 'UPDATE {wallets} SET coins = coins - ? WHERE id = ?', params: [price, buyer] },
+  { sql: 'UPDATE {wallets} SET coins = coins + ? WHERE id = ?', params: [price, seller] },
+  { sql: 'SELECT coins FROM {wallets} WHERE id = ?', params: [buyer] },
+])
+// 每条一个 { changes, results }，顺序与传入的一致；写语句的 results 是空数组
+```
+
+`batch` 省的是往返时间，不省额度：每条语句照样各算一次查询（免费版每次调用最多 50 条），写入行数也照算。它从契约版本 2 开始才有（见第 2 节的 `apiVersion`），用了它的插件装到 0.4 以前的机器人上会在安装时被拒装。`npm test` 里的 mock `ctx.db.batch` 同样先检查整批的表名，再交给你注入的替身；替身自己要实现 `batch`（比如 `node:sqlite` 在事务里逐条执行），没实现会直接报错，不会逐条假装执行——那样测不出线上的整批回滚。
+
+两个钩子都是**第一次用到这个插件时**才跑：一条事件只加载按清单可能命中它的插件（命令词对得上、正则或事件或按键命中，或者声明了中间件），加上它们依赖的服务提供者；HTTP 路由、定时任务同样只碰到它自己。别的插件的消息不会让你的插件被加载，所以别指望「随便来一条消息 onBoot 就跑了」——要在什么时机准备好，就在那个时机的入口里用得上它。
+
+`onInstall` / `onBoot` 跑完之前，同一个 isolate 里进来的其他请求会等它（不会趁它没跑完就进处理器），所以迁移放在 `onBoot` 里是安全的；反过来它卡住也会挡住这个插件在该 isolate 的所有请求，要快。
+
+注意：**没有 onUpgrade 钩子**——升级版本不触发任何钩子，表结构/数据迁移请在 `onBoot` 里做惰性检查（`onInstall` 的 KV 标记保证它跨部署只跑一次）。`onEnable` / `onDisable` 已在契约中但运行时尚未接入；`onUninstall` 已接入，见下。
+
+### 卸载时的数据
+
+卸载会先调用你的 `hooks.onUninstall(ctx, { purgeData })`——趁插件代码还在这次部署里，给你一次收尾机会（前缀之外的东西、外部服务上的资源）。它抛错不会挡住后面的清理。
+
+之后框架按前缀兜底：`purgeData` 为真时删光你的 KV 键、R2 对象和 D1 表。**默认是 false**，数据留着；面板的存储页会把它标成孤儿，可以随时单独清掉。无论清不清数据，`onInstall` 的"已装过"标记都会删掉，所以重装一定会重新建表。
+
+重建完成之前（几分钟）插件代码还在线上跑：冷启动的实例读不到标记会重跑 `onInstall`，把表建回来、把标记写回去。所以框架在**新版本上线、插件确实不在部署里之后**再由定时任务收一次尾——再删一遍标记，选了清数据的再清一遍（连面板里保存的配置一起）。这期间又装回来的话，这次收尾会被取消。
+
+### 要读别的插件的数据
+
+不要直接查它的表——查不到（前缀拦着），而且就算能查也不该查：直连是隐形依赖，对方改表结构或被卸载，你会静默坏掉，框架也看不见这层关系。
+
+正确做法是让数据的持有方导出 service：提供方声明 `services: { 名: (ctx) => 对象 }`，使用方声明 `depends: { 名: '*' }` 后 `ctx.service<类型>('名')`。这样依赖写在清单里，安装时会校验，面板上看得见。depends 未满足会在安装时被拒绝。
+
+同样的办法也用来共享能力：LLM、出图这类要配置密钥、地址的，做成一个插件对外提供服务，配置只在它那里填一次，其他插件调它的服务就行，不用各自再填一遍（内置的 [t2i](./builtin-plugins.md) 就是这么做的）。几条规则：
+
+- **只能取自己声明过的**。没在 `depends` 里声明的服务，`ctx.service()` 直接抛错——哪怕同一个请求里别的插件已经取过。
+- **可选依赖**：值写 `'optional'`（`depends: { llm: 'optional' }`），没有提供者、提供者被停用都照常安装、照常运行，取不到时 `ctx.service()` 抛错，自己 `try/catch` 后按没有处理。不要为了可选依赖去用 SDK 里新加的函数：老版本的机器人没有它，构建会失败；写成 `'optional'` 的话，老版本的机器人把它当必需依赖（缺了拒装、装了照常能用）。
+- **服务工厂每个请求调用一次**，拿到的是提供方自己的 `ctx`（自己的配置和存储）。返回的对象里别存跨请求的状态，要存放 `ctx.kv` / `ctx.db`；也做不了「别的插件来登记一下」这种接口，这次请求登记的，下次请求就没了。
+- **同名服务可以共存**：两个插件都提供 `llm`，同一时间只有一个在提供。默认是先装、且启用着的那个；面板的「插件」页会出现「同名服务」，在那里选由谁提供。选了之后它被禁用，依赖它的插件会报错，不会悄悄换成另一个。
+- **服务名就是接口约定**。叫 `llm` 的服务应该长得一样，否则换一个提供者，用它的插件就坏了。`depends` 里的版本范围目前不检查，接口要改就换个服务名（`llm2`），别悄悄改形状。
+
+### Durable Object：装之前得先改机器人仓库
+
+上面三个存储都是「最终一致、无协调」的。需要**强一致的单点**（同一个房间/同一场对局必须串行处理）、跨请求常驻的内存状态、WebSocket 长连接或 `alarm()` 自唤醒时，才轮到 Durable Object。绝大多数插件不需要——先确认 `ctx.kv` / `ctx.db` 真的解决不了，DO 带来的麻烦比它们多得多。
+
+类必须继承 `PluginDurableObject`，再挂到 `durableObjects` 上：
+
+```ts
+import { definePlugin, PluginDurableObject } from '@qqbot/sdk'
+
+export class Room extends PluginDurableObject {
+  async join(userId: string) {
+    await this.plugin.db.run('INSERT OR IGNORE INTO {members} (id) VALUES (?)', userId)
+    const rows = await this.plugin.db.all<{ n: number }>('SELECT COUNT(*) AS n FROM {members}')
+    return rows[0]?.n ?? 0
+  }
+}
+
+export default definePlugin({
+  name: 'game',
+  durableObjects: { Room },
+  commands: {
+    join: async ({ ctx, session }) => {
+      const room = ctx.durable.get<Room>('Room', session.targetId)   // 群聊是群 openid，单聊是用户 openid
+      return `当前 ${await room.join(session.userId)} 人`   // RPC，直接拿返回值
+    },
+  },
+})
+```
+
+三件事一起看：
+
+- **`ctx.durable.get(类名, 实例名)`** 取实例，实例名走 `idFromName` —— 一个群 / 一个用户 / 一局游戏一个实例。类名不在自己 `durableObjects` 里会抛错，够不到别的插件的 DO。需要 `newUniqueId` / `idFromString` 时用 `ctx.durable.namespace(类名)`。
+- **`this.plugin`** 是 DO 里的作用域上下文（`kv` / `db` / `r2` / `logger`），前缀与处理器里的 `ctx.kv` / `ctx.db` 完全一致 —— 所以 DO 里建的表卸载时也清得掉。没有 `api` 与 `config`：两者都要读快照，同步构造器等不了。`this.ctx` 仍然是平台的 `DurableObjectState`（`storage`、`blockConcurrencyWhile` 照用）。
+- **继承是强制的，`qqbot-plugin build` 会拦。** 不继承的话平台把**未加前缀的裸 env** 直接塞给你，第 6 节那套「前缀即所有权」在 DO 里就失效了：建的表框架不认识，卸载时清不掉，永远是孤儿。这种「忘了就出事、出事还看不见」的约定不能只写在文档里，所以放在构建期挡住。
+
+投影时框架把类以 **`P_<插件名>_<类名>`** 导出到 Worker 主模块（插件名里的非字母数字换成 `_`，所以是 `P_game_Room`），并在导出时挂上作用域工厂 —— `PluginDurableObject` 的构造器就是靠它把裸 env 换掉的。因此 DO 类只能经由投影入口导出，手工在 `wrangler.jsonc` 里导出会在构造时抛错。
+
+**关键一步：安装会被拦下，要先往机器人仓库补一条 migrations。** 面板预检时会把要加的内容原样给出（直接调安装 API 则返回 409 `durable_objects_migration_required`，内容相同）：
+
+```jsonc
+// apps/seed/wrangler.jsonc 的 migrations 末尾追加（tag 不能与已有重复）
+{ "tag": "p-game-room", "new_sqlite_classes": ["P_game_Room"] }
+```
+
+提交推送之后，回面板点「已加好 migrations，确认安装」即可（API 上是带 `acknowledgeDurableObjects: true` 重新安装）。只有**新增**的类才会被拦：以后升级时 DO 类没变就直接更新，新版本多了类才要再补一条。
+
+为什么不能自动：`migrations` 是**只追加的历史**，平台记着「上次应用过的 tag」，下次部署拿它在列表里定位、只应用其后的新增项。构建机每次都是全新环境，没有这个状态，造不出正确的历史——所以投影对它只校验、不合成。而校验发生在构建阶段，不在安装这一步拦住的话，插件已经写进 D1 才炸，并且**此后每一次构建都会炸**（包括之后装别的插件），直到有人想起来把它卸载。
+
+**两条安全阀在 DO 面前会失效**，这是选它之前要接受的代价：DO 类必须静态导出、随主模块求值，所以求值抛错会拖垮整个 Worker，而不是只影响自己（插件平时靠动态 `import()` 隔离求值错误，DO 是例外，见[设计决策](./design.md#_3-单-worker-触发构建自部署)的安全阀）；另外含 DO 的 Worker 没有版本预览 URL，部署时的 `/healthz` 健康检查会被跳过，坏版本不会在切流量前被拦下。
+
+卸载同样要手动收尾：类从 bundle 里消失之后，`wrangler.jsonc` 的 `migrations` 里那条 `new_sqlite_classes` 还留着。走 Versions API 的正常部署不受影响，但一旦降级到 `wrangler deploy`，声明了却不存在的类可能被拒（需要补一条 `deleted_classes`）。**这条我没有实测过**，卸载 DO 插件之后留意一下构建日志。
+
+## 7. 定时任务与主动推送
+
+```ts
+cron: {
+  daily: {
+    cron: '0 1 * * *', // 5 段，UTC！北京时间 9 点 = 1 点；支持 * a-b a,b、/ 步进与英文缩写
+    async handler({ ctx, job, scheduledAt }) {
+      await ctx.api.sendMessage({ scene: 'group', id: '群openid' }, `日报：${job}@${new Date(scheduledAt).toISOString()}`)
+    },
+  },
+},
+```
+
+表达式照标准 cron（Vixie）：星期 0 和 7 都是周日，`1-7`、`5-7` 这样写没问题；月和星期可以写英文缩写 `JAN`-`DEC`、`SUN`-`SAT`（不分大小写，区间里也行，如 `MON-FRI`）。日和星期**都**写了具体值时，任一命中就跑——`0 1 1 * MON` 是「每月 1 号，加上每个周一」，不是「恰逢周一的 1 号」；有一段以 `*` 开头（含 `*/2`）时两段都得满足。写错的表达式一次都不会触发，`qqbot-plugin build` 会打警告指出哪一段错了（不拦构建），构建日志里留意 ⚠。
+
+`cron` 处理器**没有 session**（不是事件），主动推送用 `ctx.api.sendMessage`。群聊主动消息需要群主在群里打开机器人的「主动消息」权限，见[配置 QQ 开放平台](./deploy-qq#_5-在群里打开权限)。`ctx.api` 上还有 `raw(method, path, body)`（框架未封装的接口直接调，永远可用）与 `group.*`（群管理）。
+
+## 8. 自带 Web 页面与 HTTP 接口
+
+插件可以自己提供网页和 HTTP 接口：`routes` 里声明的路由挂在 `https://<机器人域名>/p/<插件名>/` 下，处理器拿到的是标准 `Request`，返回标准 `Response`，里面照常用 `ctx.kv` / `ctx.db` / `ctx.api`。
+
+```ts
+ui: { path: '/ui/', title: '我的页面' },   // 面板侧栏「插件页面」下出现入口
+routes: [
+  // auth: 'admin' 接受面板会话或本插件的桥接令牌；不写就是 public，任何人都能访问
+  { method: 'GET', path: '/ui/*', auth: 'admin', handler: () => new Response('<h1>…</h1>', { headers: { 'content-type': 'text/html; charset=utf-8' } }) },
+  { method: 'GET', path: '/api/data', auth: 'admin', handler: async ({ ctx }) => Response.json(await ctx.kv.getJSON('data') ?? {}) },
+],
+```
+
+要把自己路由的完整地址交出去（最常见的是让 QQ 来拉图片），用 `ctx.publicUrl` 拼，不要让用户在插件配置里再填一遍机器人地址：
+
+```ts
+const base = ctx.publicUrl ?? ctx.config.public_base_url // 拿不到时退回插件自己的配置
+if (base) return { image: { url: `${base}/p/${ctx.plugin.name}/img/${id}` } }
+```
+
+`ctx.publicUrl` 是 `https://域名`，不带结尾斜杠。设置页「机器人公开地址」填了就是填的；没填时是这次请求进来的域名——事件里就是 QQ 推送用的回调地址，正是 QQ 访问得到的那个，机器人绑了几个域名也不影响。拿不到时是 `undefined`：定时任务里没填设置（没有请求）、本地 `wrangler dev`（http 的不算）、0.4 以前的机器人。所以读的时候一定要有退路，这样也不必为它提高 `apiVersion`。
+
+`path` 支持 `:param` 与末尾 `/*` 通配（值在 `params['*']`）。插件被停用时它的路由全部返回 404，面板开了安全模式时返回 503。路由被访问时和事件、定时任务一样，会先跑 `onInstall` / `onBoot`（每个 isolate 第一次用到这个插件时）——新装的插件第一个请求是打开页面也不要紧，`onInstall` 里建的表在路由处理器里可以直接用。
+
+常见的三种用法：
+
+- **面板里的管理页**：声明 `ui` 并配 `auth: 'admin'` 的路由，面板在 sandbox iframe 里打开它，页面用 `/bridge.js` 拿令牌、跟随主题、自动撑高。`auth: 'admin'` 路由返回的 HTML 会带 `Content-Security-Policy: sandbox`，所以在新窗口里打开也和 iframe 里一样是 opaque origin：拿不到面板的 localStorage（面板会话就在里面），页面自己也用不了 localStorage / cookie，要存东西走接口。公开路由不受影响。示例是内置的 `plugins/t2i`（连通性测试与试渲染）。细节见[面板与插件页面](./ui.md#插件页面-解耦方案)。
+- **给所有人看的公开页**：不写 `auth` 的路由谁都能打开，比如 `https://bot.example.com/p/rank/` 的排行榜，把链接发到群里即可。不需要声明 `ui`；想和面板同样的配色，页面里引 `/tokens.css`。
+- **接收外部回调**：公开的 `POST` 路由可以接 GitHub、支付平台这类 webhook，收到后用 `ctx.api.sendMessage` 推到群里。公开路由谁都能调，**签名要自己验**。处理器的 `authenticated` 告诉你这次请求有没有登录，公开路由也能据此区分管理员。
+
+页面简单的话，直接在处理器里返回一段 HTML 字符串，内置插件都是这么做的。要用 Vue / React 这类有构建步骤的前端：
+
+- **构建机不跑前端构建**（只装 `dependencies`、不跑安装脚本），所以前端要在你本地构建好，把产物转成 `serveAssets` 认的资源表（`{ files: { 'index.html': { body, type }, … } }`，二进制用 `encoding: 'base64'`），作为普通模块提交进仓库，再 `serveAssets('/ui/*', assets)` 一行托管。`qqbot-plugin build` 目前不会替你生成这张表，面板自己的 `packages/ui/scripts/pack.mjs` 可以照着改。
+- **`serveAssets` 默认是 `auth: 'admin'`**，而桥接令牌只在打开页面的第一个请求里（`?token=`）：页面再去加载的 JS / CSS 带不上令牌，会 401。所以要么把前端打成**单个 HTML 文件**（脚本、样式都内联），要么静态资源用 `serveAssets('/ui/*', assets, { auth: 'public' })` 公开、只把 `/api/*` 设成 `auth: 'admin'`。
+- 前端产物和插件代码一起打进 Worker，算在整个机器人的脚本体积里（上限见 Cloudflare 官方 limits 页），图片等大文件放 R2 或外链。
+
+## 9. 平台限额：免费版的硬预算
+
+整个机器人——运行时加所有插件——是**一个 Worker、一个 isolate**（第 2 节"同 isolate、无沙箱"），Cloudflare 的限额按调用分给全体共享：某个插件超限，趴下的是整台机器人。免费版（Workers Free）预算尤其紧，数字以官方 limits 页为准（2026-09 核对）。
+
+**每次调用共享**（HTTP 请求与 cron 调度同一套）：
+
+| 项 | 免费版 | 付费版 |
+| --- | --- | --- |
+| CPU 时间 | **10 ms** | 默认 30 s（可调至 5 min） |
+| 内存 | 128 MB | 128 MB |
+| 子请求（KV / D1 / R2 / fetch 全算） | **50** | 10,000 |
+| 同时等响应头的连接 | 6 | 6 |
+| 全局作用域启动 | 1 s | 1 s |
+
+**按天 / 月计**（免费版，同样全框架共享）：
+
+| 项 | 免费版额度 |
+| --- | --- |
+| Worker 请求 | 100,000 次/天（UTC 0 点重置；cron 每分钟调度一次，一天先扣 1,440） |
+| KV | 读 100,000 次/天；写、删、列各 1,000 次/天；同一 key 写 1 次/秒；单值 25 MiB；总容量 1 GB |
+| D1 | 读 500 万行/天；写 100,000 行/天；单库 500 MB；每账户 10 库共 5 GB；单条 SQL ≤100 KB、绑定 ≤100 个、单值 ≤2 MB |
+| R2 | 存储 10 GB·月；Class A（写/列）1,000,000 次/月；Class B（读）10,000,000 次/月 |
+| Images（`ctx.images`） | 不重复的变换 5,000 次/月；超了新变换报错（不扣费），缓存过的照常出 |
+| Browser Run（`ctx.browser`） | 浏览器时间 10 分钟/天；Quick Actions（`quickAction()` 截图、转 PDF 等）每 10 秒 1 次；自己开浏览器会话每 20 秒新开 1 个、同时最多 3 个 |
+
+Cron Triggers 免费版每账户只有 5 个——框架只注册一个每分钟触发器、再按插件的 cron 表达式内部分发，插件随便声明都不会撞这个限制，但**每次调度同样只有 10 ms CPU**。
+
+据此有几条纪律：
+
+- **每条消息都要看一眼的插件，写入次数不能跟着消息数涨**。这是最容易把整台机器人拖垮的一条：框架自己每条消息只写 1 行 D1（事件去重），事件摘要进 Workers Logs、不进 D1；一个插件每条消息再写一次，全机器人能处理的消息量就直接打折，写 KV 更是一天 1,000 条消息就停摆。见下面「D1 写入怎么算」。
+- **CPU 是全家共用的 10 ms**。官方统计普通请求平均约 2.2 ms——验签、匹配、其他插件先分掉一波，留给你的是零头。CPU 或内存超限的表象都是整个 Worker 偶发 1102，砸的是所有人。框架只加载这条事件按清单可能命中的插件（冷启动的 isolate 里，加载一次就是一次模块求值加 onBoot），**中间件除外：声明了中间件的插件每个事件都要加载、都要跑**。能用命令、正则、事件解决的就别写中间件。别在 handler 里干重活：大 JSON 解析、长循环、密码学哈希、几 MB 媒体的 base64 编码。重活外移——t2i 把渲染扔给外部渲染服务就是这个模式，压缩、转码、OCR 同理；发媒体优先给 `image.url`，别在 Worker 里转 base64。
+- **一次事件只有 30 秒**。运行时先给 QQ 回 ACK，再在后台处理事件，平台只给后台 30 秒——这是这次事件里**所有插件**加起来的时间，不是每个插件一份。到点直接被平台掐断，事件摘要和插件后面的日志一行都不留；框架在 25 秒时会先打一条告警，日志里至少看得到是哪个事件卡住了。调慢接口、生成大图这类活要自己拆：先回一句「处理中」，重活交给外部服务（做完再用 `ctx.api.sendMessage` 主动推，或者回调插件的公开路由），或者交给 Durable Object 在 `alarm()` 里分批跑。
+- **子请求 50 是硬顶**。一次消息处理里，每次 KV / D1 / R2 / fetch 都计 1。循环里逐条 `kv.put` 的写法 50 次就断：热路径（计数器、排行榜）用 D1 一条 SQL 顶 N 次 KV：一条 SQL 改多少行都只算一次。`ctx.db.batch()` 省的是往返时间，里面每条语句照样各算一次。
+- **日配额是全机器人共享的**，不是每插件一份。"每条消息都写库"的设计（签到、积分）会把 KV 每天 1,000 次写几天内打满，同一 key 还限 1 次/秒，并发就报错——加去重、攒批、内存缓存 + 定时落盘（落盘那次的 CPU 依然在 10 ms 里）。请求 100,000 次/天看着多：一条群消息就是一次 webhook，几个活跃群加 cron 底座就能摸到，真到量就升级付费版——CPU 30 s、子请求 10,000，上面大半焦虑直接消失。
+- **浏览器只给低频的活**。免费版的 `ctx.browser` 每 10 秒只接 1 次 Quick Actions，群里几个人同时触发，第二个起就被拒；10 分钟/天按一张图几秒算也只够一百来张，还是全机器人共用。管理员命令、偶尔截一张网页这类用它；群里人人都会触发的出图（运势、卡片）用 t2i 服务。截图拿回来的是图片字节，发给 QQ 要么转 base64（吃 CPU，见上面那条），要么存进 R2、经插件的公开路由给出地址。
+- **内存 128 MB 同样共享**。大响应别整个读进内存，能流式就流式（`ctx.r2.getStream`）；大媒体先落 R2。`ctx.waitUntil` 的后台任务和本次请求共享 CPU / 内存预算，不是白给的。
+- **cron 处理器按 10 ms 写**。每日汇总这类任务要么足够轻，要么只做"发起"，把重活交给外部服务异步完成。
+
+### D1 写入怎么算
+
+D1 按**改动的行数**计费，不按语句条数：`DELETE` 也算写入，每个受影响的索引再多算一行；把一千条语句攒成一条也省不了行数。本地 D1（`wrangler dev`）实测 `meta.rows_written`：
+
+| 写法 | 一次算几行 |
+| --- | --- |
+| `INSERT OR REPLACE`，表上主键加一个索引（第一次写、已有都一样） | 3 |
+| `INSERT … ON CONFLICT DO UPDATE`（UPSERT）改同一行，含索引列 | 2 |
+| 没有额外索引的表（`INTEGER PRIMARY KEY` 或 `WITHOUT ROWID`）插入一行 | 1 |
+| 一行 JSON 用 `json_set` / `json_patch` 一次改 N 个字段（3000 个键的行也一样） | 1 |
+| 语句执行了但一行没改（UPSERT 的 `DO UPDATE … WHERE` 不成立） | 0 |
+
+每条消息都要记点什么（活跃群友、发言计数）时，照这几条来，写入次数就跟消息数脱钩了：
+
+- **记到够用的粒度**：要的是"近 30 天谁说过话"，就只记到天，同一个人一天最多写一次。
+- **先读后写**：读 500 万行/天，是写的 50 倍；已经记过的直接跳过。
+- **一个群一行**：整群的数据放一个 JSON，攒一会儿用一条 `json_patch` 并进去（值为 `null` 的键会被删掉，过期清理可以顺手做），一次只算 1 行。别的 isolate 可能刚写过，并进去之前重读一次。
+- **攒在内存里的会丢**：isolate 随时会被回收，只适合丢几条也无所谓的数据；计费、积分这类要准的，按事件老老实实写。
+- `json_each` 这类表值函数过不了表名检查（它出现在 `FROM` 后面），要在 SQL 里遍历 JSON 就在代码里做。
+
+「今日老婆」（qflarebot-plugin-wifepicker）的活跃群友就是这么记的，可以照着看。
+
+### 发布前自查
+
+写完插件对一遍，有一条就改：
+
+- [ ] 有没有**每条消息都会执行**的写入（`events` 里的 `qq.group.message`、中间件、`bare` 命令的公共路径）？有的话按上面几条改成按粒度、先读后写、攒批。
+- [ ] 有没有用 **KV 存会频繁变的东西**（计数、状态、冷却、会话进度）？挪到 D1。
+- [ ] 有没有在**循环里一条一条地写**？合并成一条 SQL 或 `batch`；子请求一次最多 50 个。
+- [ ] 高频写的表是不是**索引太多**、用了 `INSERT OR REPLACE`？改成 UPSERT，去掉用不上的索引，非整数主键加 `WITHOUT ROWID`。
+- [ ] 清理过期数据是不是**每次都 `DELETE` 一遍**？删除也算写入，加节流（比如十分钟最多一次），或者像上面那样在写入时顺手剔掉。
+- [ ] 有没有在处理器里做**重活**（大 JSON、长循环、几 MB 的编码）？挪到外部服务，10 ms CPU 是全机器人共用的。
+
+## 10. ctx 速查
+
+| 字段/方法 | 说明 |
+| --- | --- |
+| `ctx.config` | 面板保存的配置（缺的字段回落 defaultConfig，见第 5 节） |
+| `ctx.kv` / `ctx.db` / `ctx.r2` | 隔离存储，见第 6 节 |
+| `ctx.images` | 图片处理（缩放、裁剪、转格式、叠图），Cloudflare 原生的 [Images 绑定](https://developers.cloudflare.com/images/optimization/binding/)；没绑定时是 undefined，额度全机器人共用，见[第 9 节](#_9-平台限额-免费版的硬预算) |
+| `ctx.browser` | 浏览器渲染（截图、HTML 转图片、PDF），Cloudflare 原生的 [Browser Run 绑定](https://developers.cloudflare.com/browser-run/quick-actions/)；没绑定时是 undefined。免费版限速很紧，只适合低频的活，见第 9 节 |
+| `ctx.durable` | 自己声明的 Durable Object：`get(类名, 实例名)` / `namespace(类名)`，见第 6 节 |
+| `ctx.api` | QQ OpenAPI：`me()`（机器人资料）/ `sendMessage` / `uploadMedia` / `typing` / `streamChunk` / `recallMessage` / `ackInteraction` / `group.*`（含群信息、禁言、审批、入群策略）/ `raw()`。非 2xx 统一抛带错误码说明的 `QQApiError`，结果型方法转为 `SendResult.error` |
+| `ctx.logger` | `debug / info / warn / error`，结构化 JSON 行 |
+| `ctx.service(name)` | 取其他插件提供的服务（需在 depends 声明；可选依赖取不到时抛错），见[要读别的插件的数据](#要读别的插件的数据) |
+| `ctx.waitUntil(p)` | 后台任务在响应返回后继续执行 |
+| `ctx.plugin` / `ctx.botId` | 自己的名字与版本 / 机器人 AppID |
+| `ctx.publicUrl` | 机器人的公开地址 `https://域名`，拼自己路由的完整地址用；可能没有，见第 8 节 |
+| `ctx.botAdmins` | Bot 管理员的 openid 名单（只读）；判断当前发起人用 `session.isBotAdmin`，见第 3 节权限 |
+
+有疑问先看三份代码：[`templates/plugin/src/index.ts`](https://github.com/QFlareBot/QFlareBot/blob/main/templates/plugin/src/index.ts)（起步示例，含按键）、[`plugins/t2i`](https://github.com/QFlareBot/QFlareBot/tree/main/plugins/t2i)（对外提供服务 + 插件页面）、[`@qqbot/sdk`](https://github.com/QFlareBot/QFlareBot/tree/main/packages/sdk/src) 的类型注释（字段级真相）。内置插件做什么见[内置插件](./builtin-plugins.md)。

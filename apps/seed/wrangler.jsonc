@@ -1,0 +1,41 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "qqbot",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+
+  // 模板声明：本文件只声明绑定名字与结构，不硬编码具体资源 ID 或个人域名。
+  // 首次运行引导工作流，资源 ID 将写入 Worker Secrets 并由构建端点动态下发；
+  // 自部署与构建时自动注入 wrangler.generated.jsonc，无需向 Git 仓库回写任何私有配置。
+  "kv_namespaces": [{ "binding": "KV" }],
+  // D1 可选：开启后有事件记录与插件 ctx.db。免费版最多 10 个库，配额不够时整行删掉
+  "d1_databases": [{ "binding": "DB", "database_name": "qqbot" }],
+  // R2 可选：这里只声明 binding 名，桶名由 CF_R2_NAME 注入（引导工作流写 Worker Secret，
+  // 构建机经 /admin/build-config 取回）。不要在这里硬编码桶名——那会让「R2 不可用 → 不绑定」
+  // 的降级失效：生成配置时它是个非空值，剥离分支永远进不去，R2 未激活的账户会卡在首次部署。
+  "r2_buckets": [{ "binding": "R2" }],
+
+  // 插件的 ctx.images（图片处理）与 ctx.browser（浏览器渲染）。两个都是账户自带的服务，不用建资源，
+  // 免费版也能绑，没有插件调用就不计量。额度全机器人共用：Images 每月 5,000 次变换，Browser 每天 10 分钟
+  "images": { "binding": "IMAGES" },
+  "browser": { "binding": "BROWSER" },
+
+  // 运行时只注册这一个 Cron Trigger，再按各插件声明的表达式分发
+  "triggers": { "crons": ["* * * * *"] },
+
+  // 自部署自发现用：本 Worker 的脚本名（引导工作流按 name 同步更新；手工改名时记得一起改）
+  "vars": { "WORKER_NAME": "qqbot" },
+
+  "observability": { "enabled": true },
+
+  // workers.dev 保持开启：引导把 MANIFEST_URL 指向默认域名（直连 Cloudflare 边缘，零外部 DNS
+  // 依赖），构建机拉 /admin/build-manifest 走的就是它。绑了自定义域名之后可以关——设构建
+  // 环境变量 CF_WORKERS_DEV=0，同时把 MANIFEST_URL 改成你的域名。
+  "workers_dev": true,
+  // 自定义域名不在这里声明，到 Cloudflare 后台 Worker → Settings → Domains & Routes 自己绑。
+  // 这里一旦写了 routes，每次 wrangler deploy 都按它整体替换，后台另绑的域名会被摘掉。
+  // 切流量前的健康检查打的是 <版本号前 8 位>-<name>.<子域>.workers.dev/healthz，
+  // 由下面这个开关控制，与 workers_dev 无关（workers_dev: false 时预览地址照样可用，已实测）。
+  // 关掉它预览地址就是 404，健康检查必然失败、永远切不了流量。
+  "preview_urls": true
+}

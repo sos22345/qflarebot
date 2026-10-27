@@ -1,0 +1,147 @@
+import { handleAdmin } from './admin.js'
+import { processPendingCleanups, syncBuildLedgerOnSchedule } from './adminManifest.js'
+import { serveAsset } from './assets.js'
+import { cronMatches } from './cron.js'
+import { pruneSeenEvents } from './dedupe.js'
+import { isEnabled, normalizedOf } from './dispatcher.js'
+import { error, json } from './http.js'
+import { ensureReady } from './lifecycle.js'
+import { createLogger, errorInfo } from './logger.js'
+import { PluginRegistry } from './registry.js'
+import { handlePluginRoute, PLUGIN_ROUTE_PREFIX } from './routes.js'
+import { RequestScope } from './scope.js'
+import type { ResolvedOptions, RuntimeEnv, RuntimeOptions } from './types.js'
+import { handleWebhook } from './webhook.js'
+
+export const RUNTIME_VERSION = '0.6.0'
+
+function resolveOptions(options: RuntimeOptions): ResolvedOptions {
+  return {
+    plugins: options.plugins,
+    projection: options.projection,
+    ui: options.ui,
+    webhookPath: options.webhookPath ?? '/webhook',
+    adminPath: options.adminPath ?? '/admin',
+    timestampToleranceSec: options.timestampToleranceSec ?? 300,
+    dedupeTtlSec: options.dedupeTtlSec ?? 600,
+    maxPassiveReplies: options.maxPassiveReplies ?? 5,
+    commandPrefixes: options.commandPrefixes ?? ['/'],
+    fetchImpl: options.fetchImpl ?? fetch,
+  }
+}
+
+/**
+ * 构造 Worker 导出对象。路由：
+ * - POST {webhookPath}   QQ 回调
+ * - GET  /healthz        健康检查（部署流水线切流量前调用；?plugins=1 顺带求值全部插件，有失败回 503）
+ * - {adminPath}/*        管理 API
+ * - /p/<plugin>/*        插件路由
+ * - /, /assets/*         管理面板（传入 ui 时）
+ */
+export function createRuntime(options: RuntimeOptions): ExportedHandler<RuntimeEnv> {
+  const resolved = resolveOptions(options)
+  const registry = new PluginRegistry(resolved.plugins)
+  const logger = createLogger('runtime')
+
+  return {
+    async fetch(request, env, execCtx) {
+      const url = new URL(request.url)
+      const { pathname } = url
+
+      if (pathname === '/healthz') {
+        const health = {
+          ok: true,
+          runtime: RUNTIME_VERSION,
+          projection: resolved.projection ?? null,
+          plugins: registry.all().length,
+        }
+        if (url.searchParams.get('plugins') !== '1') return json(health)
+        // 部署流水线切流量前带 plugins=1 来问：把每个插件都求值一遍，import 就抛错的插件在这里现形，
+        // 而不是等切完流量、第一个事件进来才发现。求值失败不抛（registry 记进 plugin.error）
+        const loaded = await Promise.all(registry.all().map(async (plugin) => ({ plugin, def: await plugin.load() })))
+        const pluginErrors = loaded
+          .filter(({ def }) => !def)
+          .map(({ plugin }) => ({ name: plugin.manifest.name, message: plugin.error?.message ?? '插件加载失败' }))
+        const ok = pluginErrors.length === 0
+        return json({ ...health, ok, pluginErrors }, ok ? 200 : 503)
+      }
+
+      // 路由先判定、后建 scope：面板静态资源和 404 用不到快照与凭证，不必为它们读 KV
+      const isWebhook =
+        pathname === resolved.webhookPath ||
+        // 兼容把回调地址填成站点根的情况：QQ 的推送是带签名头的 POST，面板本身从不 POST 根路径
+        (pathname === '/' && request.method === 'POST' && request.headers.has('x-signature-ed25519'))
+      const isAdmin = pathname === resolved.adminPath || pathname.startsWith(resolved.adminPath + '/')
+      const isPluginRoute = pathname.startsWith(PLUGIN_ROUTE_PREFIX)
+
+      try {
+        if (!isWebhook && !isAdmin && !isPluginRoute) {
+          if (resolved.ui) {
+            const asset = serveAsset(resolved.ui, request, pathname)
+            if (asset) return asset
+          }
+          return error('Not Found', 404)
+        }
+
+        const scope = await RequestScope.create(env, execCtx, registry, resolved, logger, url.origin)
+        if (isWebhook) return await handleWebhook(request, scope, resolved, logger)
+        if (isAdmin) {
+          return await handleAdmin(request, scope, { registry, options: resolved, logger, runtimeVersion: RUNTIME_VERSION })
+        }
+        return await handlePluginRoute(request, scope, registry, logger)
+      } catch (err) {
+        logger.error('请求处理异常', { path: pathname, ...errorInfo(err) })
+        return error('Internal Error', 500)
+      }
+    },
+
+    /** 单一 Cron Trigger 按分钟触发，再按各插件声明的表达式分发 */
+    async scheduled(event, env, execCtx) {
+      const scope = await RequestScope.create(env, execCtx, registry, resolved, logger)
+
+      // 新的去重表是覆盖式的格子，不用清；这里只把升级前的旧去重表清空，清完就不再查
+      execCtx.waitUntil(
+        pruneSeenEvents(env, resolved.dedupeTtlSec)
+          .then((removed) => {
+            if (removed > 0) logger.info('清理去重登记', { removed })
+          })
+          .catch((err) => logger.warn('清理去重登记失败', errorInfo(err))),
+      )
+
+      // 构建账本的状态回填以前只在有人打开面板时发生——装完插件关掉页面，账本就永远停在
+      // 「构建中」，24h 后还会被卡死收敛误标成失败。这里自己收敛（内部有节流与 in-flight 判空，
+      // 没有进行中的构建时不产生任何网络请求）。安全模式下也要跑：它与插件无关。
+      const adminDeps = { registry, options: resolved, logger, runtimeVersion: RUNTIME_VERSION }
+      execCtx.waitUntil(syncBuildLedgerOnSchedule(scope, adminDeps))
+      // 卸载的后半段：插件真的不在这份部署里了才删标记、按需再清数据（见 processPendingCleanups）。
+      // 同样与插件无关，安全模式下也要跑
+      execCtx.waitUntil(processPendingCleanups(scope, adminDeps))
+
+      if (scope.snapshot.safeMode) return
+      const now = new Date(event.scheduledTime)
+
+      for (const plugin of registry.all()) {
+        const { name } = plugin.manifest
+        if (!isEnabled(scope.snapshot, name)) continue
+        const jobs = plugin.manifest.cron.filter((j) => cronMatches(j.cron, now))
+        if (!jobs.length) continue
+
+        const def = await plugin.load()
+        if (!def) continue
+        await ensureReady(plugin, def, env, scope.contexts, logger)
+
+        for (const job of jobs) {
+          const impl = normalizedOf(def).cron.find((c) => c.name === job.name)
+          if (!impl) continue
+          try {
+            const ctx = await scope.contexts.prepare(plugin)
+            await impl.handler({ ctx, job: job.name, scheduledAt: event.scheduledTime })
+            logger.info('定时任务完成', { plugin: name, job: job.name })
+          } catch (err) {
+            logger.error('定时任务失败', { plugin: name, job: job.name, ...errorInfo(err) })
+          }
+        }
+      }
+    },
+  }
+}

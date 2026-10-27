@@ -1,0 +1,543 @@
+/**
+ * 插件单元测试工具：构造假的 Session / PluginContext，记录插件的出站行为。
+ * 不依赖运行时，`vitest` 中直接调用插件处理器即可。
+ *
+ * 线上会拒绝的写法，这里也拒绝：`ctx.db` 的 SQL 走同一套表名检查，`session.reply` 有同样的被动回复上限。
+ * 否则本地测试全绿、装上机器人才报错，替身就失去了意义。
+ */
+import type { BotApi, DBStatement, GroupApi, Logger, PluginContext, PluginDB, ScopedDB, ScopedKV, ScopedR2, StoredObject } from './context.js'
+import type { ScopedDurableObjects } from './durable.js'
+import type { EventName } from './events.js'
+import type {
+  Attachment,
+  Interaction,
+  InteractionCode,
+  Mention,
+  OutgoingMessage,
+  QuotedMessage,
+  Scene,
+  SendOptions,
+  SendResult,
+  SendTarget,
+  Session,
+  StreamWriter,
+} from './session.js'
+import type { ButtonInput, CommandInput, PluginDefinition } from './plugin.js'
+import { normalizePlugin } from './normalize.js'
+import { deliverReply } from './reply.js'
+import { qqAvatar } from './identity.js'
+import { flattenForExec, scopeSql, tablePrefix } from './sqlScope.js'
+
+/** 同一条消息/事件最多被动回复几条（QQ 平台限制），与运行时的默认值一致 */
+const DEFAULT_MAX_PASSIVE_REPLIES = 5
+
+export interface MockSessionOptions {
+  content?: string
+  displayContent?: string
+  scene?: Scene
+  event?: EventName
+  rawType?: string
+  targetId?: string
+  userId?: string
+  userName?: string
+  memberRole?: 'owner' | 'admin' | 'member'
+  /** 默认 false。和 ctx 的 `botAdmins` 不联动：测管理员分支就在这里设 true */
+  isBotAdmin?: boolean
+  messageId?: string | null
+  refIndex?: string
+  botId?: string
+  botName?: string
+  botAvatar?: string
+  mentions?: Mention[]
+  atMe?: boolean
+  raw?: unknown
+  attachments?: Attachment[]
+  /** 这条消息引用的消息；给了就有 `session.quote`，没给的字段取默认值（messageId 为 `mock-quoted-msg`） */
+  quote?: Partial<QuotedMessage>
+  interaction?: Partial<Pick<Interaction, 'id' | 'type' | 'buttonId' | 'buttonData' | 'featureId' | 'messageId' | 'feedback'>>
+  /**
+   * 被动回复上限，默认 5（和线上一样）。超出的 `reply` 像线上一样返回 `ok: false`，不记进 `replies`。
+   * `stream().end()` 也记一条（群聊里它就是一次 reply）；`typing` 不算
+   */
+  maxPassiveReplies?: number
+}
+
+export interface MockSession extends Session {
+  /** 按调用顺序记录的 reply；超过被动回复上限、线上发不出去的不在里面 */
+  readonly replies: OutgoingMessage[]
+  /** 按调用顺序记录的 send */
+  readonly sent: Array<{ message: OutgoingMessage; target: SendTarget | undefined }>
+  /** 流式写入的全部片段（含 end） */
+  readonly streamed: string[]
+  readonly recalled: string[]
+  readonly typingSeconds: number[]
+  /** 交互 ack 记录 */
+  readonly acks: InteractionCode[]
+}
+
+const OK: SendResult = { ok: true, status: 200, messageId: 'mock-msg', raw: {} }
+
+export function createMockSession(options: MockSessionOptions = {}): MockSession {
+  const replies: OutgoingMessage[] = []
+  const sent: MockSession['sent'] = []
+  const streamed: string[] = []
+  const recalled: string[] = []
+  const typingSeconds: number[] = []
+  const acks: InteractionCode[] = []
+
+  const messageId = options.messageId === null ? undefined : (options.messageId ?? 'mock-message-id')
+
+  // 与运行时 session.reply 同样的上限和同样的失败结果：超了不抛错，只是发不出去
+  const maxPassiveReplies = options.maxPassiveReplies ?? DEFAULT_MAX_PASSIVE_REPLIES
+  let passiveCount = 0
+  const passiveReply = (message: OutgoingMessage): SendResult => {
+    if (passiveCount >= maxPassiveReplies) {
+      return { ok: false, status: 0, error: `被动回复已达上限 ${maxPassiveReplies} 条`, raw: null }
+    }
+    passiveCount += 1
+    replies.push(message)
+    return OK
+  }
+
+  let interaction: Interaction | undefined
+  if (options.interaction) {
+    const i = options.interaction
+    interaction = {
+      id: i.id ?? 'mock-interaction',
+      type: i.type ?? 'button',
+      rawType: 11,
+      buttonId: i.buttonId ?? '',
+      buttonData: i.buttonData ?? '',
+      featureId: i.featureId ?? '',
+      messageId: i.messageId ?? '',
+      feedback: i.feedback,
+      get acked() {
+        return acks.length > 0
+      },
+      async ack(code = 0) {
+        acks.push(code)
+        return true
+      },
+    }
+  }
+
+  return {
+    botId: options.botId ?? 'test-bot',
+    botName: options.botName ?? '',
+    botAvatar: options.botAvatar ?? '',
+    platform: 'qq',
+    event: options.event ?? (interaction ? 'qq.interaction' : 'qq.group.at_message'),
+    rawType: options.rawType ?? (interaction ? 'INTERACTION_CREATE' : 'GROUP_AT_MESSAGE_CREATE'),
+    id: 'mock-event-id',
+    timestamp: Date.now(),
+    raw: options.raw ?? {},
+    scene: options.scene ?? 'group',
+    targetId: options.targetId ?? 'mock-group',
+    userId: options.userId ?? 'mock-user',
+    userName: options.userName ?? '测试用户',
+    avatarUrl: qqAvatar(options.botId ?? 'test-bot', options.userId ?? 'mock-user'),
+    memberRole: options.memberRole,
+    isBotAdmin: options.isBotAdmin ?? false,
+    messageId,
+    refIndex: options.refIndex,
+    quote: options.quote && {
+      messageId: options.quote.messageId ?? 'mock-quoted-msg',
+      content: options.quote.content ?? '',
+      attachments: options.quote.attachments ?? [],
+      refIndex: options.quote.refIndex,
+    },
+    canReply: true,
+    content: options.content ?? '',
+    displayContent: options.displayContent ?? options.content ?? '',
+    // 默认事件是 at_message（已被 @），atMe 跟着默认走
+    mentions: options.mentions ?? [],
+    atMe: options.atMe ?? true,
+    attachments: options.attachments ?? [],
+    interaction,
+    replies,
+    sent,
+    streamed,
+    recalled,
+    typingSeconds,
+    acks,
+    async reply(message) {
+      return passiveReply(message)
+    },
+    async send(message, target) {
+      sent.push({ message, target })
+      return OK
+    },
+    async typing(seconds = 10) {
+      typingSeconds.push(seconds)
+      return OK
+    },
+    stream(): StreamWriter {
+      const chunks: string[] = []
+      let ended: SendResult | undefined
+      return {
+        messageId: 'mock-stream',
+        async write(chunk) {
+          if (ended) return { ok: false, status: 0, error: '流式消息已结束，不能继续写入', raw: null }
+          streamed.push(chunk)
+          chunks.push(chunk)
+          return OK
+        },
+        async end(chunk) {
+          if (ended) return ended
+          if (chunk) {
+            streamed.push(chunk)
+            chunks.push(chunk)
+          }
+          ended = chunks.join('') ? passiveReply(chunks.join('')) : { ok: true, status: 0, raw: null }
+          return ended
+        },
+      }
+    },
+    async recall(id) {
+      recalled.push(id ?? 'mock-msg')
+      return true
+    },
+  }
+}
+
+export function createMemoryKV(): ScopedKV & { readonly data: Map<string, string> } {
+  const data = new Map<string, string>()
+  return {
+    data,
+    async get(key) {
+      return data.get(key) ?? null
+    },
+    async getJSON<T>(key: string) {
+      const v = data.get(key)
+      return v === undefined ? null : (JSON.parse(v) as T)
+    },
+    async put(key, value) {
+      data.set(key, typeof value === 'string' ? value : JSON.stringify(value))
+    },
+    async delete(key) {
+      data.delete(key)
+    },
+    async list(prefix = '') {
+      return [...data.keys()].filter((k) => k.startsWith(prefix))
+    },
+  }
+}
+
+/** 内存版 ScopedR2，值统一按 ArrayBuffer 存，便于断言字节 */
+export function createMemoryR2(): ScopedR2 & { readonly data: Map<string, { body: ArrayBuffer; meta: StoredObject }> } {
+  const data = new Map<string, { body: ArrayBuffer; meta: StoredObject }>()
+  const encoder = new TextEncoder()
+  const toBuffer = (v: ArrayBuffer | ArrayBufferView | string | ReadableStream | Blob): ArrayBuffer => {
+    if (typeof v === 'string') return encoder.encode(v).buffer as ArrayBuffer
+    if (v instanceof ArrayBuffer) return v
+    if (ArrayBuffer.isView(v)) return v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength) as ArrayBuffer
+    throw new Error('mock R2 只支持 string / ArrayBuffer / TypedArray，流与 Blob 请在集成测试里验证')
+  }
+
+  return {
+    data,
+    async get(key) {
+      return data.get(key)?.body ?? null
+    },
+    async getText(key) {
+      const e = data.get(key)
+      return e ? new TextDecoder().decode(e.body) : null
+    },
+    async getJSON<T>(key: string) {
+      const e = data.get(key)
+      return e ? (JSON.parse(new TextDecoder().decode(e.body)) as T) : null
+    },
+    async getStream(key) {
+      const e = data.get(key)
+      if (!e) return null
+      return new Response(e.body).body
+    },
+    async put(key, value, options) {
+      const body = toBuffer(value)
+      data.set(key, {
+        body,
+        meta: {
+          key,
+          size: body.byteLength,
+          uploadedAt: new Date(0),
+          ...(options?.metadata ? { metadata: options.metadata } : {}),
+        },
+      })
+    },
+    async delete(key) {
+      for (const k of Array.isArray(key) ? key : [key]) data.delete(k)
+    },
+    async head(key) {
+      return data.get(key)?.meta ?? null
+    },
+    async list(prefix = '', options) {
+      const all = [...data.values()].map((e) => e.meta).filter((m) => m.key.startsWith(prefix))
+      return options?.limit ? all.slice(0, options.limit) : all
+    },
+  }
+}
+
+export function createSilentLogger(): Logger {
+  const noop = () => {}
+  return { debug: noop, info: noop, warn: noop, error: noop }
+}
+
+export interface RecordedCall {
+  method: string
+  path: string
+  body?: unknown
+}
+
+/** 记录所有 OpenAPI 调用的假客户端；群管理接口全部走 raw 记录 */
+export function createRecordingApi(): BotApi & { readonly calls: RecordedCall[] } {
+  const calls: RecordedCall[] = []
+  const record = (method: string, path: string, body?: unknown) => {
+    calls.push(body === undefined ? { method, path } : { method, path, body })
+  }
+  const group: GroupApi = {
+    async info(g) {
+      record('GET', `/v2/groups/${g}/info`)
+      return {}
+    },
+    async botState(g) {
+      record('GET', `/v2/groups/${g}/bot_state`)
+      return {}
+    },
+    async members(g, cursor) {
+      record('GET', `/v2/groups/${g}/members?cursor=${cursor ?? ''}`)
+      return { members: [], nextCursor: '' }
+    },
+    async member(g, m) {
+      record('GET', `/v2/groups/${g}/members/${m}`)
+      return { member_openid: m, username: '', member_role: 'member', bot: false, joined_at: '' }
+    },
+    async removeMembers(g, ids, o) {
+      record('POST', `/v2/groups/${g}/batch_remove_members`, { member_openids: ids, ...o })
+      return { failedBlacklist: [] }
+    },
+    async blacklist(g) {
+      record('GET', `/v2/groups/${g}/member_blacklist`)
+      return {}
+    },
+    async updateBlacklist(g, op, ids) {
+      record('POST', `/v2/groups/${g}/member_blacklist`, { op, member_openids: ids })
+      return { failed: [] }
+    },
+    async mute(g, ops) {
+      record('POST', `/v2/groups/${g}/restrict_chat_setting`, { members: ops })
+    },
+    async muteState(g) {
+      record('GET', `/v2/groups/${g}/restrict_chat_setting`)
+      return {}
+    },
+    async joinRequests(g) {
+      record('GET', `/v2/groups/${g}/join_request_list`)
+      return []
+    },
+    async reviewJoinRequest(g, m, decision, id) {
+      record('POST', `/v2/groups/${g}/approval_join_request/${m}`, { ...decision, join_request_id: id })
+    },
+    async joinStrategies(cursor = '') {
+      record('GET', `/v2/groups/join_approval_strategy${cursor ? `?cursor=${cursor}` : ''}`)
+      return { strategies: [], nextCursor: '' }
+    },
+    async createJoinStrategy(input) {
+      record('POST', '/v2/groups/join_approval_strategy', input)
+      return { strategyId: 'st_mock', isEnable: input.isEnable ?? 'on', expireAt: '' }
+    },
+    async updateJoinStrategy(strategyId, patch) {
+      record('PATCH', `/v2/groups/join_approval_strategy/${strategyId}`, patch)
+      return { expireAt: '', ...(patch.isEnable ? { isEnable: patch.isEnable } : {}) }
+    },
+    async deleteJoinStrategy(strategyId) {
+      record('DELETE', `/v2/groups/join_approval_strategy/${strategyId}`)
+    },
+    async executeJoinStrategy(strategyId) {
+      record('POST', `/v2/groups/join_approval_strategy/${strategyId}/execute`)
+    },
+    async updateJoinStrategyWhitelist(strategyId, op, qqNumbers) {
+      record('POST', `/v2/groups/join_approval_strategy/${strategyId}/whitelist_users`, { op, whitelist_users: qqNumbers })
+      return { whitelistUserCount: qqNumbers.length }
+    },
+  }
+  return {
+    calls,
+    group,
+    async raw(method, path, body) {
+      record(method, path, body)
+      return { status: 200, data: {} as never }
+    },
+    async me() {
+      record('GET', '/users/@me')
+      return { id: 'mock-bot', username: 'MockBot', avatar: '' }
+    },
+    async sendMessage(target, message, options?: SendOptions) {
+      record('POST', `send:${target.scene}:${target.id}`, { message, options })
+      return OK
+    },
+    async uploadMedia() {
+      return { fileInfo: 'mock-file-info', fileUuid: 'mock-uuid', ttl: 86400 }
+    },
+    async typing(user, seconds) {
+      record('POST', `typing:${user}`, { seconds })
+      return OK
+    },
+    async streamChunk(user, content, options) {
+      record('POST', `stream:${user}`, { content, options })
+      return OK
+    },
+    async recallMessage(target, id) {
+      record('DELETE', `recall:${target.scene}:${target.id}:${id}`)
+      return true
+    },
+    async ackInteraction(id, code = 0) {
+      record('PUT', `/interactions/${id}`, { code })
+      return true
+    },
+  }
+}
+
+export interface MockContextOptions<C> {
+  config?: C
+  services?: Record<string, unknown>
+  /**
+   * ctx.db 的替身。插件的 SQL 先按线上的规则检查（`{表名}` 占位、越界表名一律抛错，`exec` 还查引号内换行），
+   * 不合规就抛和线上一样的错；通过了再原样交给替身——替身收到的仍是插件写的 SQL，按原文断言的测试不受影响。
+   * `ctx.db.table()` 固定返回线上的前缀，不走替身
+   */
+  db?: ScopedDB
+  r2?: ScopedR2
+  images?: ImagesBinding
+  browser?: BrowserRun
+  botId?: string
+  /** `ctx.publicUrl`，默认没有（和定时任务里、没填设置时一样） */
+  publicUrl?: string
+  /** `ctx.botAdmins`，默认空名单 */
+  botAdmins?: string[]
+  /** Durable Object 替身：键为类名。不注入时取用会抛错，提示怎么注入 */
+  durable?: Record<string, DurableObjectStub>
+}
+
+export function createMockContext<C = unknown>(
+  plugin: Pick<PluginDefinition<C>, 'name' | 'version' | 'defaultConfig'>,
+  options: MockContextOptions<C> = {},
+): PluginContext<C> {
+  const services = options.services ?? {}
+  const unavailable = (): never => {
+    throw new Error('mock 环境未提供 db，请通过 createMockContext 的 options.db 注入')
+  }
+  // SQL 先过一遍线上的表名检查（见 sqlScope.ts），写错的在本地就抛同样的错；
+  // 没注入替身时检查完再报「未提供 db」，越界的 SQL 先看到的是越界那条错
+  const prefix = tablePrefix(plugin.name)
+  const inner = options.db
+  const db: PluginDB = {
+    table: (n) => prefix + n,
+    async exec(sql) {
+      flattenForExec(scopeSql(sql, prefix))
+      return inner ? inner.exec(sql) : unavailable()
+    },
+    async run(sql, ...params) {
+      scopeSql(sql, prefix)
+      return inner ? inner.run(sql, ...params) : unavailable()
+    },
+    async all<T>(sql: string, ...params: unknown[]) {
+      scopeSql(sql, prefix)
+      return inner ? inner.all<T>(sql, ...params) : unavailable()
+    },
+    async first<T>(sql: string, ...params: unknown[]) {
+      scopeSql(sql, prefix)
+      return inner ? inner.first<T>(sql, ...params) : unavailable()
+    },
+    async batch<T>(statements: readonly DBStatement[]) {
+      for (const s of statements) scopeSql(s.sql, prefix)
+      if (!inner) return unavailable()
+      // 逐条模拟做不到线上的「整批回滚」，也分不清哪条该回 changes、哪条该回 results，不如让替身自己实现
+      if (!inner.batch) throw new Error('注入的 db 替身没有实现 batch：用 node:sqlite 的话，在事务里逐条执行、每条返回 { changes, results }')
+      return statements.length ? inner.batch<T>(statements) : []
+    },
+  }
+
+  // DO 没法在 Node 里造真的，只能由调用方注入替身；没注入就抛错点名，别让测试
+  // 撞上一句 "Cannot read properties of undefined" 再去猜
+  const durableStubs = options.durable ?? {}
+  const durable: ScopedDurableObjects = {
+    get: (className) => {
+      const stub = durableStubs[className]
+      if (!stub) {
+        throw new Error(
+          `mock 环境未提供 Durable Object ${className}，请通过 createMockContext 的 options.durable 注入`,
+        )
+      }
+      return stub as never
+    },
+    namespace: (className) => {
+      throw new Error(`mock 环境不支持 durable.namespace('${className}')，请改用 options.durable 注入实例替身`)
+    },
+  }
+
+  return {
+    plugin: { name: plugin.name, version: plugin.version ?? '0.0.0' },
+    botId: options.botId ?? 'test-bot',
+    ...(options.publicUrl ? { publicUrl: options.publicUrl } : {}),
+    botAdmins: Object.freeze([...(options.botAdmins ?? [])]),
+    config: (options.config ?? plugin.defaultConfig ?? {}) as C,
+    logger: createSilentLogger(),
+    kv: createMemoryKV(),
+    db,
+    r2: options.r2 ?? createMemoryR2(),
+    ...(options.images ? { images: options.images } : {}),
+    ...(options.browser ? { browser: options.browser } : {}),
+    api: createRecordingApi(),
+    durable,
+    service<T>(name: string): T {
+      if (!(name in services)) throw new Error(`服务未提供：${name}`)
+      return services[name] as T
+    },
+    waitUntil() {},
+  }
+}
+
+/** 直接触发插件的某个命令，返回记录了出站行为的 session */
+export async function runCommand<C>(
+  plugin: PluginDefinition<C>,
+  command: string,
+  argText = '',
+  options: { session?: MockSessionOptions; ctx?: MockContextOptions<C> } = {},
+): Promise<MockSession> {
+  const cmd = normalizePlugin(plugin).commands.find((c) => c.name === command || c.aliases?.includes(command))
+  if (!cmd) throw new Error(`插件 ${plugin.name} 没有命令 ${command}`)
+  const session = createMockSession({ content: `/${command} ${argText}`.trim(), ...options.session })
+  const ctx = createMockContext(plugin, options.ctx)
+  const input: CommandInput<C> = {
+    session,
+    ctx,
+    command,
+    args: argText.trim() ? argText.trim().split(/\s+/) : [],
+    argText: argText.trim(),
+  }
+  // 与运行时一致：返回值即回复
+  await deliverReply(session, await cmd.handler(input))
+  return session
+}
+
+/** 直接触发插件的某个回调按键；返回 session 与处理器返回的 code */
+export async function runButton<C>(
+  plugin: PluginDefinition<C>,
+  buttonId: string,
+  buttonData = '',
+  options: { session?: MockSessionOptions; ctx?: MockContextOptions<C> } = {},
+): Promise<{ session: MockSession; code: number | undefined }> {
+  const rule = normalizePlugin(plugin).buttons.find((b) => b.id === buttonId)
+  if (!rule) throw new Error(`插件 ${plugin.name} 没有按键 ${buttonId}`)
+  const session = createMockSession({
+    messageId: null,
+    interaction: { buttonId, buttonData },
+    ...options.session,
+  })
+  const ctx = createMockContext(plugin, options.ctx)
+  const input: ButtonInput<C> = { session, ctx, interaction: session.interaction!, buttonId, buttonData }
+  const result = await rule.handler(input)
+  if (typeof result === 'number') return { session, code: result }
+  await deliverReply(session, result)
+  return { session, code: undefined }
+}

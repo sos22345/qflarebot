@@ -1,0 +1,129 @@
+import { QQBotClient } from '@qqbot/api'
+import type { Logger, Session } from '@qqbot/sdk'
+import { botAdminsOf } from './botAdmins.js'
+import { ContextFactory } from './context.js'
+import { dispatch, type DispatchReport } from './dispatcher.js'
+import { ensureReady } from './lifecycle.js'
+import type { PluginRegistry } from './registry.js'
+import { publicUrlFor } from './publicUrl.js'
+import { refIndexes } from './refIndex.js'
+import { buildSession, type Sender } from './session.js'
+import { kvTokenCache, profileOf, readBotConfig, readSnapshot } from './store.js'
+import type { BotConfig, ResolvedOptions, RuntimeEnv, Snapshot } from './types.js'
+import type { WebhookPayload } from '@qqbot/api'
+
+/** 一次请求（或一次 cron 触发）内共享的依赖 */
+export class RequestScope {
+  private constructor(
+    readonly env: RuntimeEnv,
+    readonly execCtx: ExecutionContext,
+    readonly snapshot: Snapshot,
+    readonly bot: BotConfig | null,
+    readonly api: QQBotClient | null,
+    readonly contexts: ContextFactory,
+    private readonly registry: PluginRegistry,
+    private readonly options: ResolvedOptions,
+    private readonly logger: Logger,
+  ) {}
+
+  static async create(
+    env: RuntimeEnv,
+    execCtx: ExecutionContext,
+    registry: PluginRegistry,
+    options: ResolvedOptions,
+    logger: Logger,
+    /** 进来的请求的 origin，插件的 ctx.publicUrl 没填设置时用它；定时任务不传 */
+    requestOrigin?: string,
+  ): Promise<RequestScope> {
+    const [snapshot, bot] = await Promise.all([readSnapshot(env), readBotConfig(env)])
+    // 机器人发出的每条消息（被动回复、ctx.api 主动发送）都记进 ref index 对照表，引用机器人的消息撤回时要用
+    const api = bot
+      ? new QQBotClient({
+          appId: bot.appId,
+          secret: bot.secret,
+          tokenCache: kvTokenCache(env, bot.appId),
+          fetchImpl: options.fetchImpl,
+          onSent: (target, result) => refIndexes.rememberSent(target, result),
+        })
+      : null
+    const contexts = new ContextFactory({
+      env,
+      execCtx,
+      registry,
+      snapshot,
+      botId: bot?.appId ?? 'unconfigured',
+      api: api ?? unavailableApi(),
+      publicUrl: publicUrlFor(snapshot, requestOrigin),
+    })
+    return new RequestScope(env, execCtx, snapshot, bot, api, contexts, registry, options, logger)
+  }
+
+  get botId(): string {
+    return this.bot?.appId ?? 'unconfigured'
+  }
+
+  /** 把 QQ 事件变成 Session 并分发；`sender` 可替换为记录器实现 dry-run */
+  async dispatchPayload(
+    payload: WebhookPayload,
+    sender?: Sender,
+  ): Promise<{ session: Session; report: DispatchReport; outbox: number; failed: number }> {
+    let outbox = 0
+    let failed = 0
+    const inner: Sender = sender ?? this.api ?? unavailableApi()
+    // 显式委托而不是展开：QQBotClient 的方法在原型上，展开会丢
+    const counting: Sender = {
+      sendMessage: async (t, m, o) => {
+        const r = await inner.sendMessage(t, m, o)
+        if (r.ok) outbox += 1
+        else failed += 1
+        return r
+      },
+      ...(inner.typing && { typing: inner.typing.bind(inner) }),
+      // 一个流算一条回复：结束片发成功才记；失败后不再续片，所以每个流至多记一次失败
+      ...(inner.streamChunk && {
+        streamChunk: async (u, c, o) => {
+          const r = await inner.streamChunk!(u, c, o)
+          if (!r.ok) failed += 1
+          else if (o.final) outbox += 1
+          return r
+        },
+      }),
+      ...(inner.recallMessage && { recallMessage: inner.recallMessage.bind(inner) }),
+      ...(inner.ackInteraction && { ackInteraction: inner.ackInteraction.bind(inner) }),
+    }
+    const profile = profileOf(this.snapshot, this.bot?.appId)
+    const session = buildSession(payload, {
+      botId: this.botId,
+      botName: profile?.name ?? '',
+      botAvatar: profile?.avatar ?? '',
+      botAdmins: botAdminsOf(this.snapshot),
+      refIndexes,
+      sender: counting,
+      maxPassiveReplies: this.options.maxPassiveReplies,
+    })
+    const report = await dispatch(session, {
+      registry: this.registry,
+      snapshot: this.snapshot,
+      contexts: this.contexts,
+      commandPrefixes: this.options.commandPrefixes,
+      logger: this.logger,
+      prepare: (plugin, def) => ensureReady(plugin, def, this.env, this.contexts, this.logger),
+    })
+    return { session, report, outbox, failed }
+  }
+}
+
+/** 机器人未配置时的占位实现：所有出站调用都返回明确错误 */
+function unavailableApi(): QQBotClient {
+  const error = '机器人尚未配置 AppID/AppSecret'
+  return {
+    appId: '',
+    raw: async () => {
+      throw new Error(error)
+    },
+    uploadMedia: async () => {
+      throw new Error(error)
+    },
+    sendMessage: async () => ({ ok: false, status: 0, error, raw: null }),
+  } as unknown as QQBotClient
+}

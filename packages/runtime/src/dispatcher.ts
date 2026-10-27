@@ -1,0 +1,539 @@
+import {
+  deliverReply,
+  isMessageEvent,
+  meetsPermission,
+  normalizePlugin,
+  type InteractionCode,
+  type Logger,
+  type Manifest,
+  type NormalizedPlugin,
+  type PluginDefinition,
+  type SendResult,
+  type Session,
+} from '@qqbot/sdk'
+import type { ContextFactory } from './context.js'
+import { errorInfo } from './logger.js'
+import type { PluginRegistry, RegisteredPlugin } from './registry.js'
+import { providerFor } from './services.js'
+import type { Snapshot } from './types.js'
+
+export interface DispatchDeps {
+  registry: PluginRegistry
+  snapshot: Snapshot
+  contexts: ContextFactory
+  commandPrefixes: string[]
+  logger: Logger
+  /** 插件加载后、执行前的钩子（生命周期 onInstall/onBoot） */
+  prepare?: (plugin: RegisteredPlugin, def: PluginDefinition<unknown>) => Promise<void>
+}
+
+export interface MatchRecord {
+  plugin: string
+  kind: 'command' | 'regex' | 'event' | 'button'
+  name: string
+}
+
+export interface DispatchReport {
+  matched: MatchRecord[]
+  errors: Array<{ plugin: string; stage: string; message: string }>
+}
+
+interface Candidate extends MatchRecord {
+  priority: number
+  block: boolean
+  /** 命令名占的词数，只有命令有；用来让最长的命令名胜出 */
+  words?: number
+  registered: RegisteredPlugin
+  run(ctx: Parameters<NonNullable<PluginDefinition['middleware']>>[0]['ctx']): Promise<void>
+}
+
+/** 收集候选期间的错误出口：一个插件坏掉不能连带废掉整次分发 */
+interface CollectHooks {
+  /** 收集候选时就抛错（畸形定义、非法正则）——只废掉这个插件 */
+  onError(plugin: string, stage: string, err: unknown): void
+  /** 回复投递失败（限频、内容审核、令牌失效）——必须留痕，否则用户侧静默无响应 */
+  onSendFailure(plugin: string, stage: string, result: SendResult): void
+}
+
+const regexCache = new Map<string, RegExp>()
+// 同一个定义对象只归一化一次
+const normalized = new WeakMap<PluginDefinition<unknown>, NormalizedPlugin<unknown>>()
+
+export function normalizedOf(def: PluginDefinition<unknown>): NormalizedPlugin<unknown> {
+  let n = normalized.get(def)
+  if (!n) {
+    n = normalizePlugin(def)
+    normalized.set(def, n)
+  }
+  return n
+}
+
+/**
+ * `g` 会让 `String.prototype.match` 只返回整段匹配、丢掉捕获组（插件普遍写 `match[1]`），
+ * 而 `g` / `y` 都会把 `RegExp.lastIndex` 留在实例上，让 `.test()` 在多次调用间结果漂移。
+ * 插件的正则只用来「判断命中并取捕获组」，所以这两个有状态标志在这里统一剥掉。
+ */
+function compileRegex(pattern: string, flags = ''): RegExp {
+  const safeFlags = flags.replace(/[gy]/g, '')
+  const key = `${safeFlags}/${pattern}`
+  let re = regexCache.get(key)
+  if (!re) {
+    re = new RegExp(pattern, safeFlags)
+    regexCache.set(key, re)
+  }
+  return re
+}
+
+export interface ParsedCommand {
+  word: string
+  args: string[]
+  argText: string
+  /** 前缀之后、从命令词开始的原文；命令名有好几个词（子命令）时靠它切出参数原文 */
+  text: string
+  /** 来自无前缀解析时为 true：@ 了机器人（或单聊）时所有命令参与匹配，否则只有声明了 `bare: true` 的命令参与 */
+  bare: boolean
+}
+
+/** 解析命令：返回命中的前缀之后的命令词与参数 */
+export function parseCommand(content: string, prefixes: string[]): ParsedCommand | null {
+  for (const prefix of [...prefixes].sort((a, b) => b.length - a.length)) {
+    if (!content.startsWith(prefix)) continue
+    const rest = content.slice(prefix.length).trim()
+    if (!rest) continue
+    const [word = '', ...args] = rest.split(/\s+/)
+    return { word, args, argText: rest.slice(word.length).trim(), text: rest, bare: false }
+  }
+  return null
+}
+
+/** 无前缀解析：首词即命令词。仅当消息不以前缀开头时兜底，@ 了机器人或命令声明了 bare 才用得上 */
+export function parseBareCommand(content: string): ParsedCommand | null {
+  const rest = content.trim()
+  if (!rest) return null
+  const [word = '', ...args] = rest.split(/\s+/)
+  if (!word) return null
+  return { word, args, argText: rest.slice(word.length).trim(), text: rest, bare: true }
+}
+
+/**
+ * 命令名占掉消息开头的几个词，对不上返回 0：`'pixiv random'` 对 `pixiv random 大图` 返回 2。
+ * 命令名带空格即子命令；不分大小写，中间几个空白都算一个
+ */
+function matchedWords(command: ParsedCommand, name: string): number {
+  const want = name.trim().toLowerCase().split(/\s+/)
+  const have = [command.word, ...command.args]
+  if (!want[0] || want.length > have.length) return 0
+  return want.every((w, i) => have[i]!.toLowerCase() === w) ? want.length : 0
+}
+
+/** 跳过开头 n 个词之后的原文；参数里的换行与空白原样保留 */
+function textAfterWords(text: string, n: number): string {
+  const re = /\S+/g
+  let end = 0
+  for (let i = 0; i < n && re.exec(text); i++) end = re.lastIndex
+  return text.slice(end).trim()
+}
+
+function toInteractionCode(code: number): InteractionCode {
+  return code >= 0 && code <= 5 && Number.isInteger(code) ? (code as InteractionCode) : 1
+}
+
+export function isEnabled(snapshot: Snapshot, name: string): boolean {
+  return snapshot.plugins[name]?.enabled ?? true
+}
+
+/** 按群的生效范围：只管群场景，单聊/频道一律放行；快照是整体 PUT 进来的，形状不对就当没设 */
+export function groupAllowed(snapshot: Snapshot, name: string, session: Session): boolean {
+  const groups = snapshot.plugins[name]?.groups
+  if (!groups || !Array.isArray(groups.ids) || session.scene !== 'group') return true
+  const listed = groups.ids.includes(session.targetId)
+  return groups.mode === 'allow' ? listed : !listed
+}
+
+function priorityOf(snapshot: Snapshot, name: string, declared: number | undefined): number {
+  return snapshot.plugins[name]?.priority ?? declared ?? 0
+}
+
+function sceneAllowed(scenes: string[] | undefined, session: Session): boolean {
+  return !scenes || scenes.includes(session.scene)
+}
+
+/** 权限不足但其余条件（命令词/正则/场景）都命中的匹配器，供统一回复兜底判断 */
+interface DeniedMatch {
+  plugin: string
+  kind: 'command' | 'regex'
+  name: string
+  /** 命令名占的词数，只有命令有 */
+  words?: number
+}
+
+/** deliverReply 的入参类型（SDK 未导出 HandlerResult，从函数签名取） */
+type ReplyPayload = Parameters<typeof deliverReply>[1]
+
+/** 收集候选时的共享上下文；抽出来是为了让单个插件的失败能被单独兜住 */
+interface CollectContext {
+  session: Session
+  deps: DispatchDeps
+  command: ParsedCommand | null
+  candidates: Candidate[]
+  denied: DeniedMatch[]
+  send(plugin: string, stage: string, payload: ReplyPayload): Promise<void>
+}
+
+/** 这条事件的命令解析结果；不是消息事件为 null。清单预筛和收集候选共用这一份 */
+function commandOf(session: Session, deps: DispatchDeps): ParsedCommand | null {
+  if (!isMessageEvent(session.event)) return null
+  const prefixes = deps.snapshot.commandPrefixes ?? deps.commandPrefixes
+  return parseCommand(session.content, prefixes) ?? parseBareCommand(session.content)
+}
+
+/**
+ * 只看清单，判断插件这次事件**可能**用得上——用不上的连代码都不加载，onBoot / onInstall 也不跑。
+ *
+ * 以前每个事件都把全部启用的插件 import 一遍、跑一遍生命周期钩子，再逐个问「命中没有」。个人机器人流量低，
+ * isolate 经常是冷的，这一遍就落在每个事件头上，吃的是免费版每次请求那 10ms CPU——插件一多，
+ * 第一个事件就可能超时被掐掉。清单是构建时从同一份代码抽出来的（命令、正则、事件、按键、有没有中间件都在里面），
+ * 用它先筛一遍，和 collectForPlugin 的判断一致：
+ *
+ * - 有中间件：每个事件都要跑，一律加载
+ * - 命令：词对得上、场景允许（bare 规则同 collectForPlugin）；**不看权限**——权限不足的也要参与「最长命令名胜出」
+ *   和统一的权限不足回复
+ * - 正则、事件、按键：同 collectForPlugin
+ *
+ * 只允许多放、不能漏：清单缺字段（旧制品来源）、形状不对、正则编译失败，一律当作用得上，
+ * 交给 collectForPlugin 照旧处理（包括照旧把错误记到这个插件头上）。
+ */
+export function mayHandle(manifest: Manifest, session: Session, command: ParsedCommand | null): boolean {
+  try {
+    const { commands, regex, events, buttons, hasMiddleware } = manifest
+    if (!Array.isArray(commands) || !Array.isArray(regex) || !Array.isArray(events) || !Array.isArray(buttons)) return true
+    if (typeof hasMiddleware !== 'boolean' || hasMiddleware) return true
+
+    if (command) {
+      for (const cmd of commands) {
+        if (command.bare && !cmd.bare && !session.atMe) continue
+        if (!sceneAllowed(cmd.scenes, session)) continue
+        if ([cmd.name, ...(cmd.aliases ?? [])].some((c) => matchedWords(command, c) > 0)) return true
+      }
+    }
+    if (isMessageEvent(session.event)) {
+      for (const rule of regex) {
+        if (sceneAllowed(rule.scenes, session) && compileRegex(rule.pattern, rule.flags).test(session.content)) return true
+      }
+    }
+    const interaction = session.interaction
+    if (interaction && (interaction.type === 'button' || interaction.type === 'menu')) {
+      for (const rule of buttons) {
+        if (rule.id !== interaction.buttonId || !sceneAllowed(rule.scenes, session)) continue
+        if (!rule.dataPattern || compileRegex(rule.dataPattern).test(interaction.buttonData)) return true
+      }
+    }
+    return events.some((rule) => (Array.isArray(rule.event) ? rule.event.includes(session.event) : rule.event === session.event))
+  } catch {
+    return true
+  }
+}
+
+/**
+ * 这些插件 depends 里的服务由谁提供（顺着提供者自己的 depends 往下找）。提供者要先跑过 onInstall / onBoot，
+ * 服务才靠得住——以前每个事件把所有插件都准备一遍，这件事是顺带做到的；现在只加载用得上的，得显式补上。
+ * 提供者只做准备、不参与这次匹配（它自己没命中就不该执行），也不看它在本群生效没有：服务调用不受群范围限制。
+ */
+function providersOf(plugins: RegisteredPlugin[], deps: DispatchDeps): RegisteredPlugin[] {
+  const seen = new Set(plugins.map((p) => p.manifest.name))
+  const providers: RegisteredPlugin[] = []
+  const queue = [...plugins]
+  while (queue.length) {
+    const plugin = queue.pop()!
+    for (const service of Object.keys(plugin.manifest.depends ?? {})) {
+      const name = providerFor(deps.registry, deps.snapshot, service)
+      if (!name || seen.has(name)) continue
+      seen.add(name)
+      const provider = deps.registry.get(name)
+      // 提供者被停用时不管它：服务解析那一步会报出可读的错误（见 ContextFactory）
+      if (!provider || !isEnabled(deps.snapshot, name)) continue
+      providers.push(provider)
+      queue.push(provider)
+    }
+  }
+  return providers
+}
+
+function collectCandidates(
+  session: Session,
+  command: ParsedCommand | null,
+  plugins: Array<{ registered: RegisteredPlugin; def: PluginDefinition<unknown> }>,
+  deps: DispatchDeps,
+  hooks: CollectHooks,
+): { candidates: Candidate[]; denied: DeniedMatch[] } {
+  const candidates: Candidate[] = []
+  const denied: DeniedMatch[] = []
+
+  /** 投递回复并检查结果：SendResult 被丢掉时只剩事件摘要里一个失败计数，定位不到是谁、为什么 */
+  const send = async (plugin: string, stage: string, payload: ReplyPayload): Promise<void> => {
+    for (const result of await deliverReply(session, payload)) {
+      if (!result.ok) hooks.onSendFailure(plugin, stage, result)
+    }
+  }
+
+  const shared: CollectContext = { session, deps, command, candidates, denied, send }
+  for (const { registered, def } of plugins) {
+    try {
+      collectForPlugin(shared, registered, def)
+    } catch (err) {
+      // 单个插件定义畸形（非法正则、缺字段）只废掉它自己——不能让本次事件所有插件都不执行
+      hooks.onError(def.name, 'match', err)
+    }
+  }
+
+  // 命令名最长的胜出：/pixiv random 命中了 'pixiv random' 就不再算 'pixiv'，跨插件也一样。
+  // 权限不足的也参与比较——用户要的就是那条子命令，不能退回去执行父命令
+  const longest = Math.max(0, ...[...candidates, ...denied].map((c) => c.words ?? 0))
+  const keep = (c: { kind: string; words?: number }) => c.kind !== 'command' || c.words === longest
+
+  // 稳定排序：优先级高的先执行，同级按注册顺序
+  return { candidates: candidates.filter(keep).sort((a, b) => b.priority - a.priority), denied: denied.filter(keep) }
+}
+
+/** 收集单个插件的候选；独立成函数，调用方才能按插件兜异常 */
+function collectForPlugin(
+  shared: CollectContext,
+  registered: RegisteredPlugin,
+  def: PluginDefinition<unknown>,
+): void {
+  const { session, deps, command, candidates, denied, send } = shared
+  const name = def.name
+  const n = normalizedOf(def)
+
+  if (command) {
+    for (const cmd of n.commands) {
+      // 同 AstrBot：@ 机器人（含单聊）本身就是唤醒，无前缀也匹配所有命令；没 @ 时只有 bare 命令接得住。
+      // 带前缀的消息对 bare 命令同样生效
+      if (command.bare && !cmd.bare && !session.atMe) continue
+      const words = Math.max(...[cmd.name, ...(cmd.aliases ?? [])].map((c) => matchedWords(command, c)))
+      if (!words) continue
+      if (!sceneAllowed(cmd.scenes, session)) continue
+      // 和插件在处理器里调的 meetsPermission 是同一个判断；Bot 管理员身份由运行时建会话时按快照名单填好
+      if (!meetsPermission(session, cmd.permission)) {
+        denied.push({ plugin: name, kind: 'command', name: cmd.name, words })
+        continue
+      }
+      const typed = [command.word, ...command.args]
+      candidates.push({
+        plugin: name,
+        kind: 'command',
+        name: cmd.name,
+        priority: priorityOf(deps.snapshot, name, cmd.priority),
+        block: cmd.block ?? true,
+        words,
+        registered,
+        run: async (ctx) =>
+          send(
+            name,
+            `command:${cmd.name}`,
+            await cmd.handler({
+              session,
+              ctx,
+              command: typed.slice(0, words).join(' '),
+              args: typed.slice(words),
+              argText: textAfterWords(command.text, words),
+            }),
+          ),
+      })
+    }
+  }
+
+  if (isMessageEvent(session.event)) {
+    for (const rule of n.regex) {
+      if (!sceneAllowed(rule.scenes, session)) continue
+      const match = session.content.match(compileRegex(rule.pattern, rule.flags))
+      if (!match) continue
+      if (!meetsPermission(session, rule.permission)) {
+        denied.push({ plugin: name, kind: 'regex', name: rule.pattern })
+        continue
+      }
+      candidates.push({
+        plugin: name,
+        kind: 'regex',
+        name: rule.pattern,
+        priority: priorityOf(deps.snapshot, name, rule.priority),
+        block: rule.block ?? false,
+        registered,
+        run: async (ctx) => send(name, `regex:${rule.pattern}`, await rule.handler({ session, ctx, match })),
+      })
+    }
+  }
+
+  const interaction = session.interaction
+  if (interaction && (interaction.type === 'button' || interaction.type === 'menu')) {
+    for (const rule of n.buttons) {
+      if (rule.id !== interaction.buttonId) continue
+      if (rule.dataPattern && !compileRegex(rule.dataPattern).test(interaction.buttonData)) continue
+      if (!sceneAllowed(rule.scenes, session)) continue
+      candidates.push({
+        plugin: name,
+        kind: 'button',
+        name: rule.id,
+        priority: priorityOf(deps.snapshot, name, rule.priority),
+        block: rule.block ?? true,
+        registered,
+        run: async (ctx) => {
+          const result = await rule.handler({
+            session,
+            ctx,
+            interaction,
+            buttonId: interaction.buttonId,
+            buttonData: interaction.buttonData,
+          })
+          // 返回数字即回应平台的 code；返回消息则回复，ack 留给分发结束后的自动回应
+          if (typeof result === 'number') await interaction.ack(toInteractionCode(result))
+          else await send(name, `button:${rule.id}`, result)
+        },
+      })
+    }
+  }
+
+  for (const rule of n.events) {
+    if (!rule.event.includes(session.event)) continue
+    candidates.push({
+      plugin: name,
+      kind: 'event',
+      name: rule.event.join(','),
+      priority: priorityOf(deps.snapshot, name, rule.priority),
+      block: rule.block ?? false,
+      registered,
+      run: async (ctx) => send(name, `event:${rule.event.join(',')}`, await rule.handler({ session, ctx })),
+    })
+  }
+}
+
+/** 事件分发：中间件链 → 匹配器；任何插件的异常只记录、不影响其他插件 */
+export async function dispatch(session: Session, deps: DispatchDeps): Promise<DispatchReport> {
+  const report: DispatchReport = { matched: [], errors: [] }
+  if (deps.snapshot.safeMode) {
+    await session.interaction?.ack(0).catch(() => false)
+    return report
+  }
+
+  const command = commandOf(session, deps)
+  // 在本群不生效的插件连中间件都不跑：对这个群来说它就不存在。
+  // 按清单这次用不上的也不加载（见 mayHandle），只加载用得上的与它们依赖的服务提供者
+  const relevant = deps.registry
+    .all()
+    .filter((p) => isEnabled(deps.snapshot, p.manifest.name) && groupAllowed(deps.snapshot, p.manifest.name, session))
+    .filter((p) => mayHandle(p.manifest, session, command))
+  const load = (list: RegisteredPlugin[]) =>
+    Promise.all(list.map(async (registered) => ({ registered, def: await registered.load() }))).then((loaded) =>
+      loaded.filter((p): p is { registered: RegisteredPlugin; def: PluginDefinition<unknown> } => !!p.def),
+    )
+  const [plugins, providers] = await Promise.all([load(relevant), load(providersOf(relevant, deps))])
+
+  const fail = (plugin: string, stage: string, err: unknown) => {
+    const info = errorInfo(err)
+    report.errors.push({ plugin, stage, message: info.message })
+    deps.logger.error('插件执行出错', { plugin, stage, ...info })
+  }
+
+  /**
+   * 平台拒收（限频、内容审核、令牌失效）。
+   *
+   * 出站调用本身是有计数的：scope.ts 的 counting sender 会把失败累加进事件摘要的 failed，
+   * 所以「这次事件有一条没发出去」在日志里查得到。缺的是**归属与原因**——不知道是哪个插件、
+   * 哪条规则，也不知道平台回了什么状态码，wrangler tail 上更是一行都没有。这里补上。
+   */
+  const failSend = (plugin: string, stage: string, result: SendResult) => {
+    const message = `回复投递失败：HTTP ${result.status}${result.error ? `（${result.error}）` : ''}`
+    report.errors.push({ plugin, stage: `send:${stage}`, message })
+    deps.logger.error('回复投递失败', { plugin, stage, status: result.status, error: result.error })
+  }
+
+  if (deps.prepare) {
+    await Promise.all(
+      [...plugins, ...providers].map((p) => deps.prepare!(p.registered, p.def).catch((e) => fail(p.def.name, 'prepare', e))),
+    )
+  }
+
+  const runMatchers = async () => {
+    const { candidates, denied } = collectCandidates(session, command, plugins, deps, {
+      onError: fail,
+      onSendFailure: failSend,
+    })
+    if (denied.length) deps.logger.debug('权限不足，跳过候选', { denied })
+    for (const c of candidates) {
+      report.matched.push({ plugin: c.plugin, kind: c.kind, name: c.name })
+      try {
+        const ctx = await deps.contexts.prepare(c.registered)
+        await c.run(ctx)
+      } catch (err) {
+        fail(c.plugin, `${c.kind}:${c.name}`, err)
+      }
+      if (c.block) break
+    }
+    // 权限不足默认静默跳过；配置了统一回复时，仅当没有任何候选命中才补一句，避免遮蔽其他插件
+    if (denied.length && !report.matched.length && deps.snapshot.permissionDeniedReply) {
+      try {
+        for (const result of await deliverReply(session, deps.snapshot.permissionDeniedReply)) {
+          if (!result.ok) failSend('runtime', 'permission-denied', result)
+        }
+      } catch (err) {
+        fail('runtime', 'permission-denied', err)
+      }
+    }
+  }
+
+  const middlewares = plugins
+    .filter((p) => typeof p.def.middleware === 'function')
+    .sort((a, b) => priorityOf(deps.snapshot, b.def.name, 0) - priorityOf(deps.snapshot, a.def.name, 0))
+
+  const run = async (i: number): Promise<void> => {
+    const mw = middlewares[i]
+    if (!mw) return runMatchers()
+    // 后半段只跑一次：next() 调两次会把后面的中间件和处理器整个再跑一遍（重复回复），重复调用拿到同一个 promise
+    // 类型断言是为了不让 TS 把它收窄成 null：赋值发生在 next 闭包里，控制流分析看不见
+    let downstream = null as Promise<void> | null
+    const next = () => (downstream ??= run(i + 1))
+    let returned = false
+    try {
+      const ctx = await deps.contexts.prepare(mw.registered)
+      await mw.def.middleware!({ session, ctx }, next)
+      returned = true
+      // 调了 next() 却没 await：后半段还在跑，等它跑完。否则分发提前结束，自动 ack 和事件摘要都抢在处理器前面
+      if (downstream) await downstream
+    } catch (err) {
+      // 后半段自己抛的错不算在这个中间件头上，照原样往上交
+      if (returned) throw err
+      fail(mw.def.name, 'middleware', err)
+      // 中间件自身出错不应吞掉事件：没调过 next 就接着往下跑；调过的话等后半段跑完。
+      // 中间件 await next() 拿到后半段的错误再抛出来的，上面已经记过，不再记一遍
+      if (!downstream) {
+        await run(i + 1)
+      } else {
+        await downstream.catch((e: unknown) => {
+          if (e !== err) throw e
+        })
+      }
+    }
+  }
+
+  try {
+    await run(0)
+  } catch (err) {
+    // 中间件链或候选收集本身出错：事件不能静默消失，按钮更不能一直转圈——记下来，继续走下面的 ack
+    fail('runtime', 'dispatch', err)
+  }
+
+  // 按钮/菜单必须回应平台，否则客户端一直转圈；插件没处理就替它回应成功
+  const interaction = session.interaction
+  if (interaction && (interaction.type === 'button' || interaction.type === 'menu') && !interaction.acked) {
+    try {
+      // ack 失败（平台拒收、网络错误）是返回 false 而不是抛错，只靠 catch 永远看不到
+      if (!(await interaction.ack(0))) {
+        report.errors.push({ plugin: 'runtime', stage: 'ack', message: '按钮回应失败：平台未返回成功' })
+        deps.logger.error('按钮回应失败', { interactionId: interaction.id, type: interaction.type })
+      }
+    } catch (err) {
+      fail('runtime', 'ack', err)
+    }
+  }
+  return report
+}
