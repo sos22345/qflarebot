@@ -15,7 +15,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "dev": "pnpm --filter @qqbot/seed dev",
-    "deploy": "pnpm --filter @qqbot/seed deploy",
+    "deploy": "pnpm --filter @qqbot/seed run deploy",
     "clean": "pnpm -r exec rm -rf dist .wrangler"
   },
   "devDependencies": {
