@@ -4,10 +4,9 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-09-01",
 
-  // 模板声明：本文件只声明绑定名字与结构，不硬编码具体资源 ID 或个人域名。
-  // R2 按项目文档保持可选；当前账户尚未启用 R2，因此不声明该绑定。
-  "kv_namespaces": [{ "binding": "KV" }],
-  "d1_databases": [{ "binding": "DB", "database_name": "qqbot" }],
+  // Bind the resources provisioned during the first successful build attempt.
+  "kv_namespaces": [{ "binding": "KV", "id": "83ffe9cb7a214daa976b31314305da4f" }],
+  "d1_databases": [{ "binding": "DB", "database_name": "qqbot", "database_id": "86420923-55f0-488c-9176-7bc739930fb0" }],
 
   "images": { "binding": "IMAGES" },
   "browser": { "binding": "BROWSER" },
